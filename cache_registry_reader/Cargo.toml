@@ -1,10 +1,15 @@
 [package]
-name = "cache_registry_reader"
-edition = "2024"
+name = "cache-registry-reader"
+edition = "2021"
 version.workspace = true
 authors.workspace = true
 license.workspace = true
-description.workspace = true
+description = "UE4 CachedAssetRegistry.bin binary parser and JSON exporter"
 repository.workspace = true
 
 [dependencies]
+unreal_asset_base.workspace = true
+unreal_helpers.workspace = true
+byteorder.workspace = true
+serde.workspace = true
+serde_json.workspace = true
