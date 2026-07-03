@@ -120,7 +120,8 @@ fn compile(mod_loader_dir: &PathBuf) -> Result<(PathBuf, PathBuf), Box<dyn Error
         .configure_arg(format!(
             "-DUNREALCPPLOADER_VERSION={}",
             env!("CARGO_PKG_VERSION")
-        ));
+        ))
+        .configure_arg("-DCMAKE_POLICY_VERSION_MINIMUM=3.5");
 
     #[cfg(debug_assertions)]
     {

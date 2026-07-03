@@ -75,12 +75,12 @@ impl AssetPackageData {
             file_version_licensee_ue = asset.read_i32::<LE>()?;
             flags = asset.read_u32::<LE>()?;
             custom_versions =
-                Some(asset.read_array(|asset: &mut Reader| CustomVersion::read(asset))?);
+                Some(ArchiveReader::read_array(asset, |asset: &mut Reader| CustomVersion::read(asset))?);
         }
 
         let mut imported_classes = None;
         if version >= FAssetRegistryVersionType::PackageImportedClasses {
-            imported_classes = Some(asset.read_array(|asset: &mut Reader| asset.read_fname())?);
+            imported_classes = Some(ArchiveReader::read_array(asset, |asset: &mut Reader| asset.read_fname())?);
         }
 
         Ok(Self {

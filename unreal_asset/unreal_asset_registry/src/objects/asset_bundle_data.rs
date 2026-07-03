@@ -25,7 +25,7 @@ impl AssetBundleEntry {
         asset: &mut Reader,
     ) -> Result<Self, Error> {
         let bundle_name = asset.read_fname()?;
-        let bundle_assets = asset.read_array(|asset: &mut Reader| {
+        let bundle_assets = ArchiveReader::read_array(asset, |asset: &mut Reader| {
             SoftObjectPathProperty::new(
                 asset,
                 asset.get_name_map().get_mut().add_fname("None"),
@@ -79,7 +79,7 @@ impl AssetBundleData {
     pub fn new<Reader: ArchiveReader<impl PackageIndexTrait>>(
         asset: &mut Reader,
     ) -> Result<Self, Error> {
-        let bundles = asset.read_array(|asset: &mut Reader| AssetBundleEntry::new(asset))?;
+        let bundles = ArchiveReader::read_array(asset, |asset: &mut Reader| AssetBundleEntry::new(asset))?;
 
         Ok(Self { bundles })
     }

@@ -72,19 +72,21 @@ impl<Index: PackageIndexTrait> LevelExport<Index> {
 
         Ok(LevelExport {
             normal_export,
-            actors: asset.read_array(|asset| Ok(PackageIndex::new(asset.read_i32::<LE>()?)))?,
+            actors: ArchiveReader::read_array(asset, |asset| Ok(PackageIndex::new(asset.read_i32::<LE>()?)))?,
             url: URL {
                 protocol: asset.read_fstring()?,
                 host: asset.read_fstring()?,
                 map: asset.read_fstring()?,
                 portal: asset.read_fstring()?,
-                options: asset.read_array(|asset| asset.read_fstring())?,
+                options: ArchiveReader::read_array(asset, |asset| asset.read_fstring())?,
                 port: asset.read_i32::<LE>()?,
                 valid: asset.read_i32::<LE>()?,
             },
             model: PackageIndex::new(asset.read_i32::<LE>()?),
-            model_components: asset
-                .read_array(|asset| Ok(PackageIndex::new(asset.read_i32::<LE>()?)))?,
+            model_components: ArchiveReader::read_array(
+                asset,
+                |asset| Ok(PackageIndex::new(asset.read_i32::<LE>()?)),
+            )?,
             level_script: PackageIndex::new(asset.read_i32::<LE>()?),
             nav_list_start: PackageIndex::new(asset.read_i32::<LE>()?),
             nav_list_end: PackageIndex::new(asset.read_i32::<LE>()?),

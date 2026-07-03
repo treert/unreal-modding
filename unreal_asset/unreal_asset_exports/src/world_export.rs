@@ -43,10 +43,14 @@ impl<Index: PackageIndexTrait> WorldExport<Index> {
         Ok(WorldExport {
             normal_export,
             persistent_level: PackageIndex::new(asset.read_i32::<LE>()?),
-            extra_objects: asset
-                .read_array(|asset| Ok(PackageIndex::new(asset.read_i32::<LE>()?)))?,
-            streaming_levels: asset
-                .read_array(|asset| Ok(PackageIndex::new(asset.read_i32::<LE>()?)))?,
+            extra_objects: ArchiveReader::read_array(
+                asset,
+                |asset| Ok(PackageIndex::new(asset.read_i32::<LE>()?)),
+            )?,
+            streaming_levels: ArchiveReader::read_array(
+                asset,
+                |asset| Ok(PackageIndex::new(asset.read_i32::<LE>()?)),
+            )?,
         })
     }
 }

@@ -258,7 +258,7 @@ impl Usmap {
         if has_versioning {
             self.object_version = ObjectVersion::try_from(reader.read_i32::<LE>()?)?;
             self.object_version_ue5 = ObjectVersionUE5::try_from(reader.read_i32::<LE>()?)?;
-            self.custom_versions = reader.read_array(CustomVersion::read)?;
+            self.custom_versions = ArchiveReader::read_array(&mut reader, CustomVersion::read)?;
             self.net_cl = reader.read_u32::<LE>()?;
         }
 
@@ -331,7 +331,7 @@ impl Usmap {
             NameMap::new(),
         );
 
-        self.name_map = reader.read_array(|reader| {
+        self.name_map = ArchiveReader::read_array(&mut reader, |reader| {
             let name_length = reader.read_u8()?;
             let mut buf = vec![0u8; name_length as usize - 1];
             reader.read_exact(&mut buf)?;

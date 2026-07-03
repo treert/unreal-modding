@@ -12,8 +12,8 @@ members = [
     "unreal_asset/unreal_asset_proc_macro",
     "unreal_cpp_bootstrapper",
     "unreal_helpers",
-    "unreal_mod_integrator",
-    "unreal_mod_manager",
+    # "unreal_mod_integrator", # requires UE engine or USE_PREBUILT_ASSETS to build
+    # "unreal_mod_manager", # depends on unreal_mod_integrator
     "unreal_mod_metadata",
     "unreal_pak",
     "unreal_pak_cli", "cache_registry_reader",
@@ -57,8 +57,8 @@ serde_json = "1.0.104"
 serde = { version = "1.0.183", features = ["derive"] }
 thiserror = "1.0.44"
 
-[patch.crates-io]
-steamy-vdf = { git = "https://github.com/icewind1991/steamy" }
+# [patch.crates-io]
+# steamy-vdf = { git = "https://github.com/icewind1991/steamy" }  # unused after disabling unreal_mod_integrator/unreal_mod_manager
 
 [profile.release]
 opt-level = 3

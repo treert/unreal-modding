@@ -166,7 +166,7 @@ impl DependsNode {
         let mut sort_indexes = Vec::new();
         let mut pointer_dependencies = Vec::new();
 
-        let in_dependencies = asset.read_array(|asset: &mut Reader| Ok(asset.read_i32::<LE>()?))?;
+        let in_dependencies = ArchiveReader::read_array(asset, |asset: &mut Reader| Ok(asset.read_i32::<LE>()?))?;
 
         let num_flag_bits = flag_set_width * in_dependencies.len() as i32;
         let num_flag_words = (num_flag_bits + 31) / 32;
@@ -305,7 +305,7 @@ impl DependsNode {
         preallocated_depends_node_buffer: &[DependsNode],
     ) -> Result<Vec<DependsNode>, Error> {
         let mut pointer_dependencies = Vec::new();
-        let in_dependencies = asset.read_array(|asset: &mut Reader| Ok(asset.read_i32::<LE>()?))?;
+        let in_dependencies = ArchiveReader::read_array(asset, |asset: &mut Reader| Ok(asset.read_i32::<LE>()?))?;
 
         for serialize_index in &in_dependencies {
             if *serialize_index < 0

@@ -70,7 +70,7 @@ impl AssetRegistryState {
         depends_nodes: &mut Vec<DependsNode>,
         package_data: &mut Vec<AssetPackageData>,
     ) -> Result<(), Error> {
-        *assets_data = asset.read_array(|asset: &mut Reader| AssetData::new(asset, version))?;
+        *assets_data = ArchiveReader::read_array(asset, |asset: &mut Reader| AssetData::new(asset, version))?;
 
         if version < FAssetRegistryVersionType::AddedDependencyFlags {
             let local_num_depends_nodes = asset.read_i32::<LE>()?;
@@ -107,7 +107,7 @@ impl AssetRegistryState {
         }
 
         *package_data =
-            asset.read_array(|asset: &mut Reader| AssetPackageData::new(asset, version))?;
+            ArchiveReader::read_array(asset, |asset: &mut Reader| AssetPackageData::new(asset, version))?;
 
         Ok(())
     }
