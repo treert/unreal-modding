@@ -1,3 +1,562 @@
-fn main() {
-    println!("Hello, world!");
+use std::env;
+use std::fs;
+use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use byteorder::{ReadBytesExt, LE};
+use serde::Serialize;
+use serde_json;
+
+use unreal_asset_base::containers::{Chain, NameMap};
+use unreal_asset_base::object_version::{ObjectVersion, ObjectVersionUE5};
+use unreal_asset_base::reader::{ArchiveReader, ArchiveTrait, RawReader};
+use unreal_asset_base::types::PackageIndex;
+
+// ---------------------------------------------------------------------------
+// Type aliases
+// ---------------------------------------------------------------------------
+
+type CursorType = Cursor<Vec<u8>>;
+type Reader = RawReader<PackageIndex, CursorType>;
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+const MAGIC: u32 = 0x9E2A83C1;
+const EXPECTED_HEADER_VERSION: i32 = 15;
+const ASSET_REGISTRY_GUID: [u32; 4] = [0x717F9EE7, 0xE9B0493A, 0x88B39132, 0x1B388107];
+const EXPECTED_ASSET_REGISTRY_VERSION: i32 = 7;
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+// ---------------------------------------------------------------------------
+// JSON output structures (matching DevelopmentAssetRegistry.bin format)
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct OutputMetadata {
+    #[serde(rename = "ExportTime")]
+    export_time: String,
+    #[serde(rename = "EngineVersion")]
+    engine_version: String,
+    #[serde(rename = "Tool")]
+    tool: String,
+    #[serde(rename = "Version")]
+    version: String,
+    #[serde(rename = "IncludeHardReferences")]
+    include_hard_references: bool,
+    #[serde(rename = "IncludeSoftReferences")]
+    include_soft_references: bool,
+    #[serde(rename = "IncludeMetadata")]
+    include_metadata: bool,
+    #[serde(rename = "TotalAssets")]
+    total_assets: usize,
+}
+
+#[derive(Serialize)]
+struct DepsContainer {
+    #[serde(rename = "Hard")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    hard: Vec<String>,
+    #[serde(rename = "Soft")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    soft: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct AssetEntry {
+    #[serde(rename = "ObjectPath")]
+    object_path: String,
+    #[serde(rename = "PackageName")]
+    package_name: String,
+    #[serde(rename = "AssetName")]
+    asset_name: String,
+    #[serde(rename = "AssetClass")]
+    asset_class: String,
+    #[serde(rename = "PackagePath")]
+    package_path: String,
+    #[serde(rename = "PackageGuid")]
+    package_guid: String,
+    #[serde(rename = "ChunkIDs")]
+    chunk_ids: Vec<i32>,
+    #[serde(rename = "DirectDependencies")]
+    direct_dependencies: DepsContainer,
+    #[serde(rename = "DependencyCount")]
+    dependency_count: usize,
+}
+
+#[derive(Serialize)]
+struct Output {
+    #[serde(rename = "Metadata")]
+    metadata: OutputMetadata,
+    #[serde(rename = "Assets")]
+    assets: Vec<AssetEntry>,
+}
+
+// ---------------------------------------------------------------------------
+// FName / FString helpers
+// ---------------------------------------------------------------------------
+
+fn read_fname_str(reader: &mut Reader) -> Result<String, Box<dyn std::error::Error>> {
+    let fname = reader.read_fname()?;
+    Ok(fname.get_content(|s| s.to_string()))
+}
+
+fn read_fstring_unlimited(reader: &mut Reader) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    use std::mem::size_of;
+    let len: i32 = reader.read_i32::<LE>()?;
+    if len == 0 {
+        return Ok(None);
+    }
+    let (len, is_wide) = if len < 0 {
+        (-len as usize, true)
+    } else {
+        (len as usize, false)
+    };
+    if is_wide {
+        let byte_len = len.saturating_sub(1) * size_of::<u16>();
+        let mut buf = vec![0u8; byte_len];
+        reader.read_exact(&mut buf)?;
+        reader.read_u16::<LE>()?;
+        let u16_data: Vec<u16> = buf
+            .chunks(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        Ok(Some(String::from_utf16(&u16_data)?))
+    } else {
+        let byte_len = len.saturating_sub(1);
+        let mut buf = vec![0u8; byte_len];
+        reader.read_exact(&mut buf)?;
+        reader.read_u8()?;
+        Ok(Some(String::from_utf8(buf)?))
+    }
+}
+
+fn skip_fname(reader: &mut Reader) -> Result<(), Box<dyn std::error::Error>> {
+    reader.read_i32::<LE>()?;
+    reader.read_i32::<LE>()?;
+    Ok(())
+}
+
+fn read_guid_str(reader: &mut Reader) -> Result<String, Box<dyn std::error::Error>> {
+    let a = reader.read_u32::<LE>()?;
+    let b = reader.read_u32::<LE>()?;
+    let c = reader.read_u32::<LE>()?;
+    let d = reader.read_u32::<LE>()?;
+    Ok(format!("{{{:08X}-{:08X}-{:08X}-{:08X}}}", a, b, c, d))
+}
+
+fn skip_bitarray(reader: &mut Reader) -> Result<(), Box<dyn std::error::Error>> {
+    let num_bits = reader.read_i32::<LE>()?;
+    let num_words = (num_bits + 31) / 32;
+    for _ in 0..num_words {
+        reader.read_u32::<LE>()?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Name table loading
+// ---------------------------------------------------------------------------
+
+fn load_name_table(reader: &mut Reader, name_table_offset: i64) -> Result<(), Box<dyn std::error::Error>> {
+    reader.seek(SeekFrom::Start(name_table_offset as u64))?;
+    let name_count = reader.read_i32::<LE>()?;
+    println!("  Name table: {} entries", name_count);
+    for i in 0..name_count {
+        let name = reader.read_fstring()?.unwrap_or_default();
+        reader.get_name_map().get_mut().add_name_reference(name, false);
+        reader.read_u16::<LE>()?; // NonCasePreservingHash
+        reader.read_u16::<LE>()?; // CasePreservingHash
+        if i < 5 {
+            let nm = reader.get_name_map();
+            let r = nm.get_ref();
+            let list = r.get_name_map_index_list();
+            println!("    [{}] {}", list.len() - 1, r.get_name_reference((list.len() - 1) as i32));
+        }
+    }
+    println!("    ... {} total names loaded", name_count);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Core asset + dependency parsing
+// ---------------------------------------------------------------------------
+
+struct AssetCore {
+    object_path: String,
+    package_path: String,
+    asset_class: String,
+    package_name: String,
+    asset_name: String,
+    chunk_ids: Vec<i32>,
+    #[allow(dead_code)]
+    tags_and_values: Vec<(String, String)>,
+}
+
+fn parse_asset_core(
+    reader: &mut Reader,
+    include_metadata: bool,
+) -> Result<AssetCore, Box<dyn std::error::Error>> {
+    let object_path = read_fname_str(reader)?;
+    let package_path = read_fname_str(reader)?;
+    let asset_class = read_fname_str(reader)?;
+    let package_name = read_fname_str(reader)?;
+    let asset_name = read_fname_str(reader)?;
+
+    // TagsAndValues (TMap<FName, FString>)
+    let tag_count = reader.read_i32::<LE>()?;
+    let tags = if include_metadata && tag_count > 0 {
+        let mut tags = Vec::with_capacity(tag_count as usize);
+        for _ in 0..tag_count {
+            let key = read_fname_str(reader)?;
+            let val = read_fstring_unlimited(reader)?.unwrap_or_default();
+            tags.push((key, val));
+        }
+        tags
+    } else {
+        for _ in 0..tag_count {
+            read_fname_str(reader)?;
+            read_fstring_unlimited(reader)?;
+        }
+        Vec::new()
+    };
+
+    // ChunkIDs (TArray<int32>)
+    let chunk_count = reader.read_i32::<LE>()?;
+    let mut chunk_ids = Vec::with_capacity(chunk_count as usize);
+    for _ in 0..chunk_count {
+        chunk_ids.push(reader.read_i32::<LE>()?);
+    }
+
+    // Skip PackageFlags (uint32)
+    reader.read_u32::<LE>()?;
+
+    Ok(AssetCore {
+        object_path,
+        package_path,
+        asset_class,
+        package_name,
+        asset_name,
+        chunk_ids,
+        tags_and_values: tags,
+    })
+}
+
+struct PackageDepData {
+    package_guid: String,
+    hard_deps: Vec<String>,
+    soft_deps: Vec<String>,
+}
+
+fn parse_dependency_data(
+    reader: &mut Reader,
+) -> Result<PackageDepData, Box<dyn std::error::Error>> {
+    // PackageName (FName) — skip, we already have it
+    skip_fname(reader)?;
+
+    // TArray<FObjectImport> ImportMap → collect package names for hard deps
+    let import_count = reader.read_i32::<LE>()?;
+    let mut hard_deps = Vec::with_capacity(import_count as usize);
+    for _ in 0..import_count {
+        skip_fname(reader)?; // ClassPackage
+        skip_fname(reader)?; // ClassName
+        reader.read_i32::<LE>()?; // OuterIndex
+        skip_fname(reader)?; // ObjectName
+        let dep_name = read_fname_str(reader)?;
+        if dep_name != "None" {
+            hard_deps.push(dep_name);
+        }
+    }
+    hard_deps.sort();
+    hard_deps.dedup();
+
+    // TArray<FName> SoftPackageReferenceList
+    let soft_ref_count = reader.read_i32::<LE>()?;
+    let mut soft_deps = Vec::with_capacity(soft_ref_count as usize);
+    for _ in 0..soft_ref_count {
+        let dep = read_fname_str(reader)?;
+        if dep != "None" {
+            soft_deps.push(dep);
+        }
+    }
+    soft_deps.sort();
+    soft_deps.dedup();
+
+    // TMap<FPackageIndex, TArray<FName>> SearchableNamesMap — skip
+    let map_count = reader.read_i32::<LE>()?;
+    for _ in 0..map_count {
+        reader.read_i32::<LE>()?; // key
+        let name_count = reader.read_i32::<LE>()?;
+        for _ in 0..name_count {
+            skip_fname(reader)?;
+        }
+    }
+
+    // FAssetPackageData::SerializeForCache
+    skip_fname(reader)?;                        // PackageName
+    let package_guid = read_guid_str(reader)?;  // Guid (16 bytes)
+    reader.read_i64::<LE>()?;                   // skip trailing 8 bytes (zeros in editor cache)
+
+    // TBitArray<> ImportUsedInGame
+    skip_bitarray(reader)?;
+    // TBitArray<> SoftPackageUsedInGame
+    skip_bitarray(reader)?;
+
+    Ok(PackageDepData {
+        package_guid,
+        hard_deps,
+        soft_deps,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Package parsing (flattened to asset list)
+// ---------------------------------------------------------------------------
+
+fn parse_all_assets(
+    reader: &mut Reader,
+    num_packages: i32,
+    limit: Option<usize>,
+    no_hard_refs: bool,
+    no_soft_refs: bool,
+    include_metadata: bool,
+) -> Result<Vec<AssetEntry>, Box<dyn std::error::Error>> {
+    let actual_pkg_count = if let Some(lim) = limit {
+        num_packages.min(lim as i32) as usize
+    } else {
+        num_packages as usize
+    };
+
+    let mut assets = Vec::new();
+
+    for i in 0..actual_pkg_count {
+        // FDiskCachedAssetData
+        read_fname_str(reader)?;                // PackageName (outer) — skip
+        reader.read_i64::<LE>()?;               // Timestamp — skip
+        read_fname_str(reader)?;                // Extension — skip
+        let asset_data_count = reader.read_i32::<LE>()?;
+
+        // Collect core asset data
+        let mut asset_cores = Vec::with_capacity(asset_data_count as usize);
+        for _ in 0..asset_data_count {
+            asset_cores.push(parse_asset_core(reader, include_metadata)?);
+        }
+
+        // Parse dependency data (shared by all assets in this package)
+        let dep = parse_dependency_data(reader)?;
+
+        // Emit flattened entries
+        for a in asset_cores {
+            let hard = if no_hard_refs { Vec::new() } else { dep.hard_deps.clone() };
+            let soft = if no_soft_refs { Vec::new() } else { dep.soft_deps.clone() };
+            let dep_count = hard.len() + soft.len();
+            assets.push(AssetEntry {
+                object_path: a.object_path,
+                package_name: a.package_name,
+                asset_name: a.asset_name,
+                asset_class: a.asset_class,
+                package_path: a.package_path,
+                package_guid: dep.package_guid.clone(),
+                chunk_ids: a.chunk_ids,
+                direct_dependencies: DepsContainer { hard, soft },
+                dependency_count: dep_count,
+            });
+        }
+
+        if (i + 1) % 10000 == 0 {
+            println!("  Parsed {}/{} packages, {} assets...", i + 1, actual_pkg_count, assets.len());
+        }
+    }
+
+    Ok(assets)
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = env::args().collect();
+    if args.len() < 2 {
+        eprintln!(
+            "Usage: {} <CachedAssetRegistry.bin> [output.json] [Options]",
+            args[0]
+        );
+        eprintln!();
+        eprintln!("  Parses UE4 Editor's CachedAssetRegistry.bin and exports to JSON.");
+        eprintln!();
+        eprintln!("Options:");
+        eprintln!("  --limit N       Only export the first N packages (default: all)");
+        eprintln!("  -NoHardRefs     Exclude hard references");
+        eprintln!("  -NoSoftRefs     Exclude soft references");
+        eprintln!("  -IncludeMetadata Include asset metadata (tags & values)");
+        return Ok(());
+    }
+
+    let input_path = &args[1];
+    let mut output_path = String::from("output.json");
+    let mut limit: Option<usize> = None;
+    let mut no_hard_refs = false;
+    let mut no_soft_refs = false;
+    let mut include_metadata = false;
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--limit" => {
+                i += 1;
+                if i < args.len() {
+                    limit = Some(args[i].parse()?);
+                }
+            }
+            "-NoHardRefs" => no_hard_refs = true,
+            "-NoSoftRefs" => no_soft_refs = true,
+            "-IncludeMetadata" => include_metadata = true,
+            other => {
+                output_path = other.to_string();
+            }
+        }
+        i += 1;
+    }
+
+    // ---- Read file ----
+    println!("Loading: {}", input_path);
+    let file_bytes = fs::read(input_path)?;
+    let file_len = file_bytes.len();
+    println!("File size: {} bytes ({:.2} MB)", file_len, file_len as f64 / 1024.0 / 1024.0);
+
+    // ---- Create reader ----
+    let cursor = Cursor::new(file_bytes);
+    let name_map = NameMap::new();
+    let mut reader = RawReader::new(
+        Chain::new(cursor, None),
+        ObjectVersion::VER_UE4_ASSETREGISTRY_DEPENDENCYFLAGS,
+        ObjectVersionUE5::UNKNOWN,
+        false,
+        name_map.clone(),
+    );
+
+    // ---- FNameTableArchive Header ----
+    let magic = reader.read_u32::<LE>()?;
+    if magic != MAGIC {
+        eprintln!("ERROR: Bad magic: 0x{:08X}, expected 0x{:08X}", magic, MAGIC);
+        return Err("Invalid magic number".into());
+    }
+    println!("Magic: 0x{:08X} OK", magic);
+
+    let header_version = reader.read_i32::<LE>()?;
+    if header_version != EXPECTED_HEADER_VERSION {
+        eprintln!("WARNING: Header version = {}, expected {}", header_version, EXPECTED_HEADER_VERSION);
+    } else {
+        println!("Header Version: {} OK", header_version);
+    }
+
+    let name_table_offset = reader.read_i64::<LE>()?;
+    println!("NameTableOffset: 0x{:X}", name_table_offset);
+
+    // ---- Load name table ----
+    println!("\n=== Loading Name Table ===");
+    load_name_table(&mut reader, name_table_offset)?;
+
+    // ---- Seek back to body start ----
+    reader.seek(SeekFrom::Start(0x10))?;
+
+    // ---- Validate AssetRegistryVersion ----
+    let guid_a = reader.read_u32::<LE>()?;
+    let guid_b = reader.read_u32::<LE>()?;
+    let guid_c = reader.read_u32::<LE>()?;
+    let guid_d = reader.read_u32::<LE>()?;
+    if guid_a != ASSET_REGISTRY_GUID[0] || guid_b != ASSET_REGISTRY_GUID[1]
+        || guid_c != ASSET_REGISTRY_GUID[2] || guid_d != ASSET_REGISTRY_GUID[3]
+    {
+        eprintln!(
+            "WARNING: AssetRegistryVersion Guid mismatch: got {:08X}-{:08X}-{:08X}-{:08X}, expected {:08X}-{:08X}-{:08X}-{:08X}",
+            guid_a, guid_b, guid_c, guid_d,
+            ASSET_REGISTRY_GUID[0], ASSET_REGISTRY_GUID[1], ASSET_REGISTRY_GUID[2], ASSET_REGISTRY_GUID[3],
+        );
+    } else {
+        println!("AssetRegistryVersion Guid: OK");
+    }
+
+    let asset_registry_version = reader.read_i32::<LE>()?;
+    if asset_registry_version != EXPECTED_ASSET_REGISTRY_VERSION {
+        eprintln!(
+            "WARNING: AssetRegistryVersion = {}, expected {}",
+            asset_registry_version, EXPECTED_ASSET_REGISTRY_VERSION
+        );
+    } else {
+        println!("AssetRegistryVersion: {} OK", asset_registry_version);
+    }
+
+    // ---- Parse body ----
+    let num_packages = reader.read_i32::<LE>()?;
+    println!("\n=== Parsing Packages ===");
+    println!("NumPackages: {}", num_packages);
+    if let Some(lim) = limit {
+        println!("Limit: first {} packages", lim);
+    }
+
+    let assets = parse_all_assets(&mut reader, num_packages, limit, no_hard_refs, no_soft_refs, include_metadata)?;
+
+    // ---- Build metadata ----
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    let now_secs = now.as_secs();
+    let days_since_epoch = now_secs / 86400;
+    let (year, month, day) = civil_from_days(days_since_epoch as i64);
+    let time_of_day = now_secs % 86400;
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+    let seconds = time_of_day % 60;
+    let export_time = format!(
+        "{:04}.{:02}.{:02}-{:02}.{:02}.{:02}",
+        year, month, day, hours, minutes, seconds
+    );
+
+    let total_assets = assets.len();
+
+    // ---- Write JSON ----
+    println!("\n=== Writing JSON ({} assets) ===", total_assets);
+    let output = Output {
+        metadata: OutputMetadata {
+            export_time,
+            engine_version: String::from("4.26.2"),
+            tool: String::from("cache-registry-reader"),
+            version: VERSION.to_string(),
+            include_hard_references: !no_hard_refs,
+            include_soft_references: !no_soft_refs,
+            include_metadata,
+            total_assets,
+        },
+        assets,
+    };
+
+    let json = serde_json::to_string_pretty(&output)?;
+    fs::write(&output_path, json)?;
+
+    let output_size = fs::metadata(&output_path)?.len();
+    println!("Output: {} ({:.2} MB)", output_path, output_size as f64 / 1024.0 / 1024.0);
+    println!("Done!");
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Simple date calculation (no extra deps)
+// ---------------------------------------------------------------------------
+
+/// Convert days since Unix epoch to (year, month, day).
+/// Algorithm from http://howardhinnant.github.io/date_algorithms.html
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
 }

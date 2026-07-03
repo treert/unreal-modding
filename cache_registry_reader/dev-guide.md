@@ -99,8 +99,10 @@
 use unreal_asset_base::reader::{ArchiveReader, RawReader};
 use unreal_asset_base::containers::{NameMap, Chain, SharedResource};
 
+use byteorder::{ReadBytesExt, LE};
+
 let cursor = std::io::Cursor::new(file_bytes);
-let name_map = SharedResource::new(NameMap::new());
+let mut name_map = SharedResource::new(NameMap::new());
 let mut reader = RawReader::new(
     Chain::new(cursor, None),
     ObjectVersion::VER_UE4_25,  // 或从文件推断
@@ -213,7 +215,7 @@ cargo run -p cache-registry-reader -- "D:/LetsGoEditor/Editor/LetsGo/Intermediat
 ```
 cache-registry-reader
 ├── unreal_asset_base  (RawReader, NameMap, FName, ArchiveReader)
-│   ├── unreal_helpers (UnrealReadExt, read_fstring_len, Guid)
+│   ├── unreal_helpers (UnrealReadExt, read_ext::read_fstring_len, Guid)
 │   │   └── byteorder
 │   └── unreal_asset_proc_macro (derive macros)
 ├── serde / serde_json  (JSON output)
