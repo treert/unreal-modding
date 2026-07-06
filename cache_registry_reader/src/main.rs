@@ -806,13 +806,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         eprintln!(
-            "Usage: {} <RegistryFile.bin> [./tmp/output.json] [Options]",
+            "Usage: {} <RegistryFile.bin> [./tmp/<input-file-name>.json] [Options]",
             args[0]
         );
         eprintln!();
         eprintln!("  Parses UE4 CachedAssetRegistry.bin or DevelopmentAssetRegistry.bin");
         eprintln!("  and exports to JSON. Format is auto-detected.");
-        eprintln!("  Default output: ./tmp/output.json");
+        eprintln!("  Default output: ./tmp/<input-file-name>.json (e.g. foo.bin -> ./tmp/foo.bin.json)");
         eprintln!();
         eprintln!("Options:");
         eprintln!("  --limit N         Only export the first N packages/assets (default: all)");
@@ -834,7 +834,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let input_path = &args[1];
-    let mut output_path = String::from("./tmp/output.json");
+    let input_file_name = std::path::Path::new(input_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("output");
+    let mut output_path = format!("./tmp/{}.json", input_file_name);
     let mut limit: Option<usize> = None;
     let mut no_hard_refs = false;
     let mut no_soft_refs = false;
