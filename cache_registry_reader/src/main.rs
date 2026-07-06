@@ -134,6 +134,9 @@ struct AssetEntry {
     direct_dependencies: DepsContainer,
     #[serde(rename = "DependencyCount")]
     dependency_count: usize,
+    #[serde(rename = "TagsAndValues")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tags_and_values: Option<std::collections::BTreeMap<String, String>>,
 }
 
 #[derive(Serialize)]
@@ -716,6 +719,11 @@ fn parse_all_assets(
                 dep.soft_deps.clone()
             };
             let dep_count = hard.len() + soft.len();
+            let tags = if include_metadata && !a.tags_and_values.is_empty() {
+                Some(a.tags_and_values.into_iter().collect())
+            } else {
+                None
+            };
             assets.push(AssetEntry {
                 object_path: a.object_path,
                 package_name: a.package_name,
@@ -725,6 +733,7 @@ fn parse_all_assets(
                 package_guid: dep.package_guid.clone(),
                 direct_dependencies: DepsContainer { hard, soft },
                 dependency_count: dep_count,
+                tags_and_values: tags,
             });
         }
 
@@ -996,6 +1005,11 @@ fn parse_dev_registry(
         let hard = if no_hard_refs { Vec::new() } else { deps.hard };
         let soft = if no_soft_refs { Vec::new() } else { deps.soft };
         let dep_count = hard.len() + soft.len();
+        let tags = if include_metadata && !a.tags_and_values.is_empty() {
+            Some(a.tags_and_values.into_iter().collect())
+        } else {
+            None
+        };
         assets.push(AssetEntry {
             object_path: a.object_path,
             package_name: a.package_name,
@@ -1005,6 +1019,7 @@ fn parse_dev_registry(
             package_guid: pkg_guid,
             direct_dependencies: DepsContainer { hard, soft },
             dependency_count: dep_count,
+            tags_and_values: tags,
         });
     }
 
