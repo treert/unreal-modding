@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{Cursor, Read, Seek, SeekFrom};
@@ -136,7 +136,7 @@ struct AssetEntry {
     dependency_count: usize,
     #[serde(rename = "TagsAndValues")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    tags_and_values: Option<std::collections::BTreeMap<String, String>>,
+    tags_and_values: Option<BTreeMap<String, serde_json::Value>>,
 }
 
 #[derive(Serialize)]
@@ -192,6 +192,274 @@ fn skip_fname(reader: &mut Reader) -> Result<(), Box<dyn std::error::Error>> {
     reader.read_i32::<LE>()?;
     reader.read_i32::<LE>()?;
     Ok(())
+}
+
+fn fib_chars_to_bytes(
+    chars: &[char],
+    offset: usize,
+    len: usize,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let end = offset
+        .checked_add(len)
+        .ok_or("FiBData byte range overflows usize")?;
+    if end > chars.len() {
+        return Err(format!(
+            "FiBData byte range {}..{} exceeds encoded length {}",
+            offset,
+            end,
+            chars.len()
+        )
+        .into());
+    }
+
+    let mut bytes = Vec::with_capacity(len);
+    for ch in &chars[offset..end] {
+        let value = *ch as u32;
+        if value == 0 || value > 256 {
+            return Err(format!("Invalid FiBData encoded byte char: U+{:04X}", value).into());
+        }
+        bytes.push((value - 1) as u8);
+    }
+    Ok(bytes)
+}
+
+fn read_fib_i32(chars: &[char], offset: usize) -> Result<i32, Box<dyn std::error::Error>> {
+    let bytes = fib_chars_to_bytes(chars, offset, 4)?;
+    Ok(i32::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+fn read_i32_from_bytes(
+    bytes: &[u8],
+    offset: &mut usize,
+) -> Result<i32, Box<dyn std::error::Error>> {
+    if bytes.len().saturating_sub(*offset) < 4 {
+        return Err("Unexpected end of FiBData lookup table while reading i32".into());
+    }
+    let value = i32::from_le_bytes(bytes[*offset..*offset + 4].try_into().unwrap());
+    *offset += 4;
+    Ok(value)
+}
+
+fn read_u32_from_bytes(
+    bytes: &[u8],
+    offset: &mut usize,
+) -> Result<u32, Box<dyn std::error::Error>> {
+    if bytes.len().saturating_sub(*offset) < 4 {
+        return Err("Unexpected end of FiBData lookup table while reading u32".into());
+    }
+    let value = u32::from_le_bytes(bytes[*offset..*offset + 4].try_into().unwrap());
+    *offset += 4;
+    Ok(value)
+}
+
+fn read_u8_from_bytes(bytes: &[u8], offset: &mut usize) -> Result<u8, Box<dyn std::error::Error>> {
+    if *offset >= bytes.len() {
+        return Err("Unexpected end of FiBData lookup table while reading u8".into());
+    }
+    let value = bytes[*offset];
+    *offset += 1;
+    Ok(value)
+}
+
+fn read_fstring_from_bytes(
+    bytes: &[u8],
+    offset: &mut usize,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let raw_len = read_i32_from_bytes(bytes, offset)?;
+    if raw_len == 0 {
+        return Ok(None);
+    }
+
+    let (len, is_wide) = if raw_len < 0 {
+        (
+            raw_len
+                .checked_neg()
+                .ok_or("Invalid FiBData FString length")? as usize,
+            true,
+        )
+    } else {
+        (raw_len as usize, false)
+    };
+    if len == 0 {
+        return Ok(None);
+    }
+
+    if is_wide {
+        let byte_len = len
+            .checked_mul(2)
+            .ok_or("FiBData wide FString length overflows usize")?;
+        if bytes.len().saturating_sub(*offset) < byte_len {
+            return Err("Unexpected end of FiBData lookup table while reading wide FString".into());
+        }
+        let payload_len = (len - 1) * 2;
+        let payload = &bytes[*offset..*offset + payload_len];
+        let terminator = u16::from_le_bytes(
+            bytes[*offset + payload_len..*offset + payload_len + 2]
+                .try_into()
+                .unwrap(),
+        );
+        *offset += byte_len;
+        if terminator != 0 {
+            return Err(format!("Invalid FiBData wide FString terminator: {}", terminator).into());
+        }
+        let units = payload
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        Ok(Some(String::from_utf16(&units)?))
+    } else {
+        if bytes.len().saturating_sub(*offset) < len {
+            return Err("Unexpected end of FiBData lookup table while reading FString".into());
+        }
+        let payload_len = len - 1;
+        let payload = &bytes[*offset..*offset + payload_len];
+        let terminator = bytes[*offset + payload_len];
+        *offset += len;
+        if terminator != 0 {
+            return Err(format!("Invalid FiBData FString terminator: {}", terminator).into());
+        }
+        Ok(Some(String::from_utf8(payload.to_vec())?))
+    }
+}
+
+fn read_fib_lookup_text(
+    bytes: &[u8],
+    offset: &mut usize,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let _flags = read_u32_from_bytes(bytes, offset)?;
+    let history_type = read_u8_from_bytes(bytes, offset)? as i8;
+    match history_type {
+        -1 => {
+            let has_culture_invariant_string = read_u8_from_bytes(bytes, offset)? != 0;
+            if has_culture_invariant_string {
+                Ok(read_fstring_from_bytes(bytes, offset)?.unwrap_or_default())
+            } else {
+                Ok(String::new())
+            }
+        }
+        0 => {
+            let _namespace = read_fstring_from_bytes(bytes, offset)?;
+            let key = read_fstring_from_bytes(bytes, offset)?.unwrap_or_default();
+            let source = read_fstring_from_bytes(bytes, offset)?.unwrap_or_default();
+            Ok(if source.is_empty() { key } else { source })
+        }
+        other => Err(format!("Unsupported FiBData FText history type: {}", other).into()),
+    }
+}
+
+fn read_fib_lookup_table(
+    bytes: &[u8],
+) -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
+    let mut offset = 0;
+    let count = read_i32_from_bytes(bytes, &mut offset)?;
+    if count < 0 {
+        return Err(format!("Negative FiBData lookup table count: {}", count).into());
+    }
+
+    let mut lookup_table = BTreeMap::new();
+    for _ in 0..count {
+        let key = read_i32_from_bytes(bytes, &mut offset)?;
+        let value = read_fib_lookup_text(bytes, &mut offset)?;
+        lookup_table.insert(key.to_string(), value);
+    }
+    Ok(lookup_table)
+}
+
+fn summarize_fib_data(value: &str) -> String {
+    let chars = value.chars().collect::<Vec<_>>();
+    let encoded_chars = chars.len();
+    if encoded_chars >= 8 {
+        if let (Ok(version), Ok(lookup_table_bytes)) =
+            (read_fib_i32(&chars, 0), read_fib_i32(&chars, 4))
+        {
+            if lookup_table_bytes >= 0 {
+                let json_chars = encoded_chars.saturating_sub(8 + lookup_table_bytes as usize);
+                return format!(
+                    "特殊字符串：FiBData 是 UE Find-in-Blueprints 编码数据；encoded_chars={}, version={}, lookup_table_bytes={}, json_chars={}；使用 --decode-fib-data 展开。",
+                    encoded_chars, version, lookup_table_bytes, json_chars
+                );
+            }
+        }
+    }
+
+    format!(
+        "特殊字符串：FiBData 是 UE Find-in-Blueprints 编码数据；encoded_chars={}；使用 --decode-fib-data 展开。",
+        encoded_chars
+    )
+}
+
+fn decode_fib_data(value: &str) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let chars = value.chars().collect::<Vec<_>>();
+    let encoded_chars = chars.len();
+    if encoded_chars < 8 {
+        return Err("FiBData is too short to contain version and lookup table size".into());
+    }
+
+    let version = read_fib_i32(&chars, 0)?;
+    let lookup_table_byte_size = read_fib_i32(&chars, 4)?;
+    if lookup_table_byte_size < 0 {
+        return Err(format!(
+            "Negative FiBData lookup table byte size: {}",
+            lookup_table_byte_size
+        )
+        .into());
+    }
+
+    let lookup_table_char_len = lookup_table_byte_size as usize;
+    let json_start = 8usize
+        .checked_add(lookup_table_char_len)
+        .ok_or("FiBData JSON offset overflows usize")?;
+    let lookup_table_bytes = fib_chars_to_bytes(&chars, 8, lookup_table_char_len)?;
+    let lookup_table = read_fib_lookup_table(&lookup_table_bytes)?;
+    if json_start > chars.len() {
+        return Err("FiBData JSON offset exceeds encoded length".into());
+    }
+    let json_text = chars[json_start..].iter().collect::<String>();
+    let json_value = serde_json::from_str::<serde_json::Value>(&json_text)?;
+
+    Ok(serde_json::json!({
+        "Type": "DecodedFiBData",
+        "EncodedLength": encoded_chars,
+        "Version": version,
+        "LookupTableByteSize": lookup_table_byte_size,
+        "LookupTableEntryCount": lookup_table.len(),
+        "LookupTable": lookup_table,
+        "Json": json_value,
+    }))
+}
+
+fn metadata_tag_to_json_value(
+    key: &str,
+    value: &str,
+    decode_fib_data_flag: bool,
+) -> serde_json::Value {
+    if key != "FiBData" {
+        return serde_json::Value::String(value.to_string());
+    }
+
+    if decode_fib_data_flag {
+        decode_fib_data(value).unwrap_or_else(|err| {
+            serde_json::json!({
+                "Type": "FiBDataDecodeError",
+                "EncodedLength": value.chars().count(),
+                "Error": err.to_string(),
+            })
+        })
+    } else {
+        serde_json::Value::String(summarize_fib_data(value))
+    }
+}
+
+fn metadata_tags_to_json(
+    tags: Vec<(String, String)>,
+    decode_fib_data_flag: bool,
+) -> BTreeMap<String, serde_json::Value> {
+    tags.into_iter()
+        .map(|(key, value)| {
+            let json_value = metadata_tag_to_json_value(&key, &value, decode_fib_data_flag);
+            (key, json_value)
+        })
+        .collect()
 }
 
 fn read_guid_str(reader: &mut Reader) -> Result<String, Box<dyn std::error::Error>> {
@@ -676,6 +944,7 @@ fn parse_all_assets(
     no_hard_refs: bool,
     no_soft_refs: bool,
     include_metadata: bool,
+    decode_fib_data_flag: bool,
     filter: &FilterConfig,
 ) -> Result<Vec<AssetEntry>, Box<dyn std::error::Error>> {
     let actual_pkg_count = if let Some(lim) = limit {
@@ -720,7 +989,10 @@ fn parse_all_assets(
             };
             let dep_count = hard.len() + soft.len();
             let tags = if include_metadata && !a.tags_and_values.is_empty() {
-                Some(a.tags_and_values.into_iter().collect())
+                Some(metadata_tags_to_json(
+                    a.tags_and_values,
+                    decode_fib_data_flag,
+                ))
             } else {
                 None
             };
@@ -760,6 +1032,7 @@ fn parse_cached_registry(
     no_hard_refs: bool,
     no_soft_refs: bool,
     include_metadata: bool,
+    decode_fib_data_flag: bool,
     filter: &FilterConfig,
 ) -> Result<(Vec<AssetEntry>, String), Box<dyn std::error::Error>> {
     // ---- FNameTableArchive Header ----
@@ -833,6 +1106,7 @@ fn parse_cached_registry(
         no_hard_refs,
         no_soft_refs,
         include_metadata,
+        decode_fib_data_flag,
         filter,
     )?;
 
@@ -860,6 +1134,7 @@ fn parse_dev_registry(
     no_hard_refs: bool,
     no_soft_refs: bool,
     include_metadata: bool,
+    decode_fib_data_flag: bool,
     filter: &FilterConfig,
 ) -> Result<(Vec<AssetEntry>, i32), Box<dyn std::error::Error>> {
     // ---- Header: GUID + Version ----
@@ -1006,7 +1281,10 @@ fn parse_dev_registry(
         let soft = if no_soft_refs { Vec::new() } else { deps.soft };
         let dep_count = hard.len() + soft.len();
         let tags = if include_metadata && !a.tags_and_values.is_empty() {
-            Some(a.tags_and_values.into_iter().collect())
+            Some(metadata_tags_to_json(
+                a.tags_and_values,
+                decode_fib_data_flag,
+            ))
         } else {
             None
         };
@@ -1078,10 +1356,7 @@ fn version_name(v: i32) -> &'static str {
 // ---------------------------------------------------------------------------
 
 fn print_help(program: &str) {
-    eprintln!(
-        "Usage: {} <RegistryFile.bin> [Options]",
-        program
-    );
+    eprintln!("Usage: {} <RegistryFile.bin> [Options]", program);
     eprintln!();
     eprintln!("  Parses UE4 CachedAssetRegistry.bin or DevelopmentAssetRegistry.bin");
     eprintln!("  and exports to JSON. Format is auto-detected.");
@@ -1095,6 +1370,7 @@ fn print_help(program: &str) {
     eprintln!("  -NoHardRefs        Exclude hard references");
     eprintln!("  -NoSoftRefs        Exclude soft references");
     eprintln!("  -IncludeMetadata   Include asset metadata (tags & values)");
+    eprintln!("  --decode-fib-data  Decode FiBData metadata into Version + LookupTable + Json");
     eprintln!("  --help, -h         Show this help message");
     eprintln!();
     eprintln!("Filter Options (case-insensitive, combined with AND):");
@@ -1104,7 +1380,10 @@ fn print_help(program: &str) {
     eprintln!("Examples:");
     eprintln!("  {} CachedAssetRegistry.bin", program);
     eprintln!("  {} CachedAssetRegistry.bin -o out.json", program);
-    eprintln!("  {} CachedAssetRegistry.bin --output ./reports/out.json --limit 100", program);
+    eprintln!(
+        "  {} CachedAssetRegistry.bin --output ./reports/out.json --limit 100",
+        program
+    );
     eprintln!("  --class Blueprint,Texture2D");
     eprintln!("  --path /Game/Characters/*");
     eprintln!("  --path */BP_Sword*            (filter by asset name)");
@@ -1135,6 +1414,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut no_hard_refs = false;
     let mut no_soft_refs = false;
     let mut include_metadata = false;
+    let mut decode_fib_data_flag = false;
     let mut filter = FilterConfig::default();
     let mut i = 2;
     while i < args.len() {
@@ -1157,6 +1437,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "-NoHardRefs" => no_hard_refs = true,
             "-NoSoftRefs" => no_soft_refs = true,
             "-IncludeMetadata" => include_metadata = true,
+            "--decode-fib-data" => {
+                decode_fib_data_flag = true;
+                include_metadata = true;
+            }
             "--class" => {
                 i += 1;
                 if i < args.len() {
@@ -1175,7 +1459,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             other => {
-                eprintln!("WARNING: Unknown argument '{}' ignored. Use --help to see usage.", other);
+                eprintln!(
+                    "WARNING: Unknown argument '{}' ignored. Use --help to see usage.",
+                    other
+                );
             }
         }
         i += 1;
@@ -1236,6 +1523,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             no_hard_refs,
             no_soft_refs,
             include_metadata,
+            decode_fib_data_flag,
             &filter,
         )?
     } else {
@@ -1245,6 +1533,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             no_hard_refs,
             no_soft_refs,
             include_metadata,
+            decode_fib_data_flag,
             &filter,
         )?;
         let ev = format!("4.26.2 (registry v{})", version);
@@ -1384,6 +1673,76 @@ mod tests {
         bytes.write_i32::<LE>((value.len() + 1) as i32).unwrap();
         bytes.extend_from_slice(value.as_bytes());
         bytes.push(0);
+    }
+
+    fn bytes_to_ue_string(bytes: &[u8]) -> String {
+        bytes
+            .iter()
+            .map(|byte| char::from_u32(*byte as u32 + 1).unwrap())
+            .collect()
+    }
+
+    fn write_fib_base_text(bytes: &mut Vec<u8>, value: &str) {
+        bytes.write_u32::<LE>(8).unwrap(); // ETextFlag::InitializedFromString
+        bytes.write_i8(0).unwrap(); // ETextHistoryType::Base
+        write_fstring(bytes, "FindInBlueprintManager");
+        write_fstring(bytes, value);
+        write_fstring(bytes, value);
+    }
+
+    fn encoded_fib_data_sample() -> String {
+        let mut lookup_table = Vec::new();
+        lookup_table.write_i32::<LE>(2).unwrap();
+        lookup_table.write_i32::<LE>(0).unwrap();
+        write_fib_base_text(&mut lookup_table, "Root");
+        lookup_table.write_i32::<LE>(1).unwrap();
+        write_fib_base_text(&mut lookup_table, "Value");
+
+        let mut version = Vec::new();
+        version.write_i32::<LE>(1).unwrap();
+        let mut lookup_table_size = Vec::new();
+        lookup_table_size
+            .write_i32::<LE>(lookup_table.len() as i32)
+            .unwrap();
+
+        format!(
+            "{}{}{}{}",
+            bytes_to_ue_string(&version),
+            bytes_to_ue_string(&lookup_table_size),
+            bytes_to_ue_string(&lookup_table),
+            r#"{"0":"1"}"#
+        )
+    }
+
+    #[test]
+    fn fib_data_defaults_to_summary_string() {
+        let encoded = encoded_fib_data_sample();
+
+        let value = metadata_tag_to_json_value("FiBData", encoded.as_str(), false);
+
+        let summary = value.as_str().expect("FiBData summary should be a string");
+        assert!(summary.contains("特殊字符串"));
+        assert!(summary.contains("encoded_chars="));
+        assert!(summary.contains("version=1"));
+        assert!(summary.contains("lookup_table_bytes="));
+        assert!(summary.contains("json_chars=9"));
+    }
+
+    #[test]
+    fn decode_fib_data_outputs_version_lookup_table_and_json() {
+        let encoded = encoded_fib_data_sample();
+
+        let value = metadata_tag_to_json_value("FiBData", encoded.as_str(), true);
+        let object = value
+            .as_object()
+            .expect("decoded FiBData should be an object");
+
+        assert_eq!(object["Type"], "DecodedFiBData");
+        assert_eq!(object["Version"], 1);
+        assert_eq!(object["LookupTableEntryCount"], 2);
+        assert_eq!(object["LookupTable"]["0"], "Root");
+        assert_eq!(object["LookupTable"]["1"], "Value");
+        assert_eq!(object["Json"]["0"], "1");
     }
 
     fn write_asset_core(bytes: &mut Vec<u8>) {
@@ -1694,6 +2053,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             &FilterConfig::default(),
         )
         .unwrap();
@@ -1760,6 +2120,7 @@ mod tests {
         let result = parse_dev_registry(
             &mut reader,
             None,
+            false,
             false,
             false,
             false,
