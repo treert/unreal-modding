@@ -315,6 +315,25 @@ struct PackageDepData {
     soft_deps: Vec<String>,
 }
 
+#[derive(Clone, Default)]
+struct DevDirectDeps {
+    hard: Vec<String>,
+    soft: Vec<String>,
+}
+
+struct DevDependsNodeData {
+    package_name: Option<String>,
+    package_dep_indices: Vec<i32>,
+    package_flag_bits: Vec<u32>,
+}
+
+// LetsGo UE4.26 serializes package dependency EDependencyProperty values as
+// packed 5-bit fields, without a TBitArray length or flag-word count.
+const DEV_PACKAGE_FLAG_SET_WIDTH: usize = 5;
+const DEV_MANAGE_FLAG_SET_WIDTH: usize = 1;
+const DEV_DEP_PROPERTY_HARD: u8 = 0x1;
+const DEV_DEP_PROPERTY_GAME: u8 = 0x2;
+
 fn parse_dependency_data(
     reader: &mut Reader,
 ) -> Result<PackageDepData, Box<dyn std::error::Error>> {
@@ -374,6 +393,184 @@ fn parse_dependency_data(
         hard_deps,
         soft_deps,
     })
+}
+
+fn read_dev_asset_identifier_package_name(
+    reader: &mut Reader,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let field_bits = reader.read_u8()?;
+    let package_name = if (field_bits & 0x01) != 0 {
+        Some(read_fname_str(reader)?)
+    } else {
+        None
+    };
+    if (field_bits & 0x02) != 0 {
+        skip_fname(reader)?;
+    }
+    if (field_bits & 0x04) != 0 {
+        skip_fname(reader)?;
+    }
+    if (field_bits & 0x08) != 0 {
+        skip_fname(reader)?;
+    }
+    Ok(package_name)
+}
+
+fn read_i32_index_array(reader: &mut Reader) -> Result<Vec<i32>, Box<dyn std::error::Error>> {
+    let count = reader.read_i32::<LE>()?;
+    if count < 0 {
+        return Err(format!("Negative dependency index array count: {}", count).into());
+    }
+    let mut indexes = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        indexes.push(reader.read_i32::<LE>()?);
+    }
+    Ok(indexes)
+}
+
+fn read_dev_dependency_flags(
+    reader: &mut Reader,
+    dependency_count: usize,
+    flag_set_width: usize,
+) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+    let num_bits = dependency_count.saturating_mul(flag_set_width);
+    let num_words = num_bits.div_ceil(32);
+    let mut words = Vec::with_capacity(num_words);
+    for _ in 0..num_words {
+        words.push(reader.read_u32::<LE>()?);
+    }
+    Ok(words)
+}
+
+fn read_dev_dependency_indices_and_flags(
+    reader: &mut Reader,
+    flag_set_width: usize,
+) -> Result<(Vec<i32>, Vec<u32>), Box<dyn std::error::Error>> {
+    let indexes = read_i32_index_array(reader)?;
+    let flags = read_dev_dependency_flags(reader, indexes.len(), flag_set_width)?;
+    Ok((indexes, flags))
+}
+
+fn bit_is_set(words: &[u32], bit_index: usize) -> bool {
+    words
+        .get(bit_index / 32)
+        .map(|word| ((word >> (bit_index % 32)) & 1) != 0)
+        .unwrap_or(false)
+}
+
+fn read_packed_flag_value(words: &[u32], dependency_pos: usize, flag_set_width: usize) -> u8 {
+    let base = dependency_pos * flag_set_width;
+    let mut value = 0u8;
+    for bit in 0..flag_set_width {
+        if bit_is_set(words, base + bit) {
+            value |= 1 << bit;
+        }
+    }
+    value
+}
+
+fn dev_dep_has_package_property(
+    words: &[u32],
+    dependency_pos: usize,
+    predicate: impl Fn(u8) -> bool,
+) -> bool {
+    let flag = read_packed_flag_value(words, dependency_pos, DEV_PACKAGE_FLAG_SET_WIDTH);
+    (flag & DEV_DEP_PROPERTY_GAME) != 0 && predicate(flag)
+}
+
+fn parse_dev_dependency_section(
+    reader: &mut Reader,
+    dep_section_size: i64,
+) -> Result<HashMap<String, DevDirectDeps>, Box<dyn std::error::Error>> {
+    if dep_section_size < 0 {
+        return Err(format!("Negative DependencySectionSize: {}", dep_section_size).into());
+    }
+
+    let dep_section_start = reader.seek(SeekFrom::Current(0))?;
+    let dep_section_end = dep_section_start + dep_section_size as u64;
+    let num_nodes = reader.read_i32::<LE>()?;
+    if num_nodes < 0 {
+        return Err(format!("Negative NumDependsNodes: {}", num_nodes).into());
+    }
+
+    let mut nodes = Vec::with_capacity(num_nodes as usize);
+    for node_index in 0..num_nodes {
+        let node_pos = reader.seek(SeekFrom::Current(0))?;
+        let package_name = read_dev_asset_identifier_package_name(reader).map_err(|err| {
+            format!(
+                "Failed to read DependsNode {} identifier at 0x{:X}: {}",
+                node_index, node_pos, err
+            )
+        })?;
+        let (package_dep_indices, package_flag_bits) =
+            read_dev_dependency_indices_and_flags(reader, DEV_PACKAGE_FLAG_SET_WIDTH).map_err(
+                |err| {
+                    format!(
+                        "Failed to read DependsNode {} package dependencies at 0x{:X}: {}",
+                        node_index, node_pos, err
+                    )
+                },
+            )?;
+        read_i32_index_array(reader).map_err(|err| {
+            format!(
+                "Failed to read DependsNode {} name dependencies at 0x{:X}: {}",
+                node_index, node_pos, err
+            )
+        })?;
+        read_dev_dependency_indices_and_flags(reader, DEV_MANAGE_FLAG_SET_WIDTH).map_err(
+            |err| {
+                format!(
+                    "Failed to read DependsNode {} manage dependencies at 0x{:X}: {}",
+                    node_index, node_pos, err
+                )
+            },
+        )?;
+        read_i32_index_array(reader).map_err(|err| {
+            format!(
+                "Failed to read DependsNode {} referencers at 0x{:X}: {}",
+                node_index, node_pos, err
+            )
+        })?;
+        nodes.push(DevDependsNodeData {
+            package_name,
+            package_dep_indices,
+            package_flag_bits,
+        });
+    }
+
+    reader.seek(SeekFrom::Start(dep_section_end))?;
+
+    let mut deps_by_package = HashMap::new();
+    for node in &nodes {
+        let Some(package_name) = &node.package_name else {
+            continue;
+        };
+        let mut deps = DevDirectDeps::default();
+        for (dep_pos, dep_index) in node.package_dep_indices.iter().enumerate() {
+            if *dep_index < 0 || *dep_index as usize >= nodes.len() {
+                return Err(format!("Invalid dependency node index: {}", dep_index).into());
+            }
+            let Some(dep_package_name) = &nodes[*dep_index as usize].package_name else {
+                continue;
+            };
+            if dev_dep_has_package_property(&node.package_flag_bits, dep_pos, |flag| {
+                (flag & DEV_DEP_PROPERTY_HARD) != 0
+            }) {
+                deps.hard.push(dep_package_name.clone());
+            } else if dev_dep_has_package_property(&node.package_flag_bits, dep_pos, |flag| {
+                flag != 0
+            }) {
+                deps.soft.push(dep_package_name.clone());
+            }
+        }
+        deps.hard.sort();
+        deps.hard.dedup();
+        deps.soft.sort();
+        deps.soft.dedup();
+        deps_by_package.insert(package_name.clone(), deps);
+    }
+
+    Ok(deps_by_package)
 }
 
 // ---------------------------------------------------------------------------
@@ -594,6 +791,8 @@ fn parse_cached_registry(
 fn parse_dev_registry(
     reader: &mut Reader,
     limit: Option<usize>,
+    no_hard_refs: bool,
+    no_soft_refs: bool,
     include_metadata: bool,
     filter: &FilterConfig,
 ) -> Result<(Vec<AssetEntry>, i32), Box<dyn std::error::Error>> {
@@ -687,6 +886,7 @@ fn parse_dev_registry(
     // ---- Dependency section ----
     println!("\n=== Dependency Section ===");
     let mut guid_map: HashMap<String, String> = HashMap::new();
+    let mut deps_map: HashMap<String, DevDirectDeps> = HashMap::new();
 
     if version >= 7 {
         // AddedDependencyFlags: section is wrapped with a size field.
@@ -696,10 +896,13 @@ fn parse_dev_registry(
             dep_section_size,
             dep_section_size as f64 / 1024.0 / 1024.0
         );
-        println!("  Skipping dependency section (DependsNode graph not yet parsed)");
-        reader.seek(SeekFrom::Current(dep_section_size))?;
+        deps_map = parse_dev_dependency_section(reader, dep_section_size)?;
+        println!(
+            "  Parsed {} dependency nodes with package identifiers",
+            deps_map.len()
+        );
     } else {
-        eprintln!("WARNING: Version {} < 7, DependsNode skipping not implemented. Dependencies will be empty.", version);
+        eprintln!("WARNING: Version {} < 7, DependsNode parsing before flags not implemented. Dependencies will be empty.", version);
         // For old versions, we can't easily skip the dependency section.
         // Just warn and continue; PackageData parsing may fail.
     }
@@ -732,6 +935,10 @@ fn parse_dev_registry(
             continue;
         }
         let pkg_guid = guid_map.get(&a.package_name).cloned().unwrap_or_default();
+        let deps = deps_map.get(&a.package_name).cloned().unwrap_or_default();
+        let hard = if no_hard_refs { Vec::new() } else { deps.hard };
+        let soft = if no_soft_refs { Vec::new() } else { deps.soft };
+        let dep_count = hard.len() + soft.len();
         assets.push(AssetEntry {
             object_path: a.object_path,
             package_name: a.package_name,
@@ -740,11 +947,8 @@ fn parse_dev_registry(
             package_path: a.package_path,
             package_guid: pkg_guid,
             chunk_ids: a.chunk_ids,
-            direct_dependencies: DepsContainer {
-                hard: Vec::new(),
-                soft: Vec::new(),
-            },
-            dependency_count: 0,
+            direct_dependencies: DepsContainer { hard, soft },
+            dependency_count: dep_count,
         });
     }
 
@@ -812,7 +1016,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!();
         eprintln!("  Parses UE4 CachedAssetRegistry.bin or DevelopmentAssetRegistry.bin");
         eprintln!("  and exports to JSON. Format is auto-detected.");
-        eprintln!("  Default output: ./tmp/<input-file-name>.json (e.g. foo.bin -> ./tmp/foo.bin.json)");
+        eprintln!(
+            "  Default output: ./tmp/<input-file-name>.json (e.g. foo.bin -> ./tmp/foo.bin.json)"
+        );
         eprintln!();
         eprintln!("Options:");
         eprintln!("  --limit N         Only export the first N packages/assets (default: all)");
@@ -948,7 +1154,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &filter,
         )?
     } else {
-        let (assets, version) = parse_dev_registry(&mut reader, limit, include_metadata, &filter)?;
+        let (assets, version) = parse_dev_registry(
+            &mut reader,
+            limit,
+            no_hard_refs,
+            no_soft_refs,
+            include_metadata,
+            &filter,
+        )?;
         let ev = format!("4.26.2 (registry v{})", version);
         (assets, ev)
     };
@@ -1077,6 +1290,180 @@ mod tests {
         )
     }
 
+    fn write_fname(bytes: &mut Vec<u8>, index: i32) {
+        bytes.write_i32::<LE>(index).unwrap();
+        bytes.write_i32::<LE>(0).unwrap();
+    }
+
+    fn write_fstring(bytes: &mut Vec<u8>, value: &str) {
+        bytes.write_i32::<LE>((value.len() + 1) as i32).unwrap();
+        bytes.extend_from_slice(value.as_bytes());
+        bytes.push(0);
+    }
+
+    fn write_asset_core(bytes: &mut Vec<u8>) {
+        write_fname(bytes, 0); // ObjectPath: /Game/InitBank.InitBank
+        write_fname(bytes, 1); // PackagePath: /Game
+        write_fname(bytes, 2); // AssetClass: AkInitBank
+        write_fname(bytes, 3); // PackageName: /Game/InitBank
+        write_fname(bytes, 4); // AssetName: InitBank
+        bytes.write_i32::<LE>(0).unwrap(); // TagsAndValues
+        bytes.write_i32::<LE>(0).unwrap(); // ChunkIDs
+        bytes.write_u32::<LE>(0).unwrap(); // PackageFlags
+    }
+
+    fn write_package_dependency_array(bytes: &mut Vec<u8>, indexes: &[i32], flag_word: u32) {
+        bytes.write_i32::<LE>(indexes.len() as i32).unwrap();
+        for index in indexes {
+            bytes.write_i32::<LE>(*index).unwrap();
+        }
+        if !indexes.is_empty() {
+            bytes.write_u32::<LE>(flag_word).unwrap();
+        }
+    }
+
+    fn write_index_array(bytes: &mut Vec<u8>, indexes: &[i32]) {
+        bytes.write_i32::<LE>(indexes.len() as i32).unwrap();
+        for index in indexes {
+            bytes.write_i32::<LE>(*index).unwrap();
+        }
+    }
+
+    fn pack_dev_package_flags(flags: &[u8]) -> Vec<u32> {
+        let mut words = vec![0u32; (flags.len() * DEV_PACKAGE_FLAG_SET_WIDTH).div_ceil(32)];
+        for (dep_pos, flag_value) in flags.iter().enumerate() {
+            let base = dep_pos * DEV_PACKAGE_FLAG_SET_WIDTH;
+            for bit in 0..DEV_PACKAGE_FLAG_SET_WIDTH {
+                if ((flag_value >> bit) & 1) != 0 {
+                    words[(base + bit) / 32] |= 1 << ((base + bit) % 32);
+                }
+            }
+        }
+        words
+    }
+
+    #[test]
+    fn dev_dependency_output_ignores_non_game_package_flags() {
+        let words = pack_dev_package_flags(&[
+            0x5, // Hard|Build: editor/build-only, should not be exported
+            0x7, // Hard|Game|Build: exported hard dependency
+            0x4, // Build-only self dependency, should not be exported as soft
+            0x6, // Game|Build: exported soft dependency
+        ]);
+        let names = [
+            "hard_build_only",
+            "hard_game",
+            "build_only_self",
+            "soft_game",
+        ];
+        let mut hard = Vec::new();
+        let mut soft = Vec::new();
+        for dep_pos in 0..names.len() {
+            if dev_dep_has_package_property(&words, dep_pos, |flag| {
+                (flag & DEV_DEP_PROPERTY_HARD) != 0
+            }) {
+                hard.push(names[dep_pos]);
+            } else if dev_dep_has_package_property(&words, dep_pos, |flag| flag != 0) {
+                soft.push(names[dep_pos]);
+            }
+        }
+
+        assert_eq!(hard, vec!["hard_game"]);
+        assert_eq!(soft, vec!["soft_game"]);
+    }
+
+    fn minimal_dev_registry_with_initbank_hard_dependency() -> Reader {
+        let names = [
+            "/Game/InitBank.InitBank",
+            "/Game",
+            "AkInitBank",
+            "/Game/InitBank",
+            "InitBank",
+            "/Script/AkAudio",
+        ];
+        let mut bytes = Vec::new();
+        for word in ASSET_REGISTRY_GUID {
+            bytes.write_u32::<LE>(word).unwrap();
+        }
+        bytes.write_i32::<LE>(8).unwrap();
+        let name_table_offset_pos = bytes.len();
+        bytes.write_i64::<LE>(0).unwrap();
+
+        bytes.write_i32::<LE>(1).unwrap(); // AssetCount
+        write_asset_core(&mut bytes);
+
+        let dep_section_size_pos = bytes.len();
+        bytes.write_i64::<LE>(0).unwrap();
+        let dep_section_start = bytes.len();
+        bytes.write_i32::<LE>(2).unwrap(); // NumDependsNodes
+
+        bytes.write_u8(0x01).unwrap(); // node 0 identifier: PackageName
+        write_fname(&mut bytes, 3); // /Game/InitBank
+        write_package_dependency_array(&mut bytes, &[1], 7); // Hard|Game|Build
+        write_index_array(&mut bytes, &[]); // Name dependencies
+        write_package_dependency_array(&mut bytes, &[], 0); // Manage dependencies
+        write_index_array(&mut bytes, &[]); // Referencers
+
+        bytes.write_u8(0x01).unwrap(); // node 1 identifier: PackageName
+        write_fname(&mut bytes, 5); // /Script/AkAudio
+        write_package_dependency_array(&mut bytes, &[], 0);
+        write_index_array(&mut bytes, &[]);
+        write_package_dependency_array(&mut bytes, &[], 0);
+        write_index_array(&mut bytes, &[]);
+
+        let dep_section_size = (bytes.len() - dep_section_start) as i64;
+        bytes[dep_section_size_pos..dep_section_size_pos + 8]
+            .copy_from_slice(&dep_section_size.to_le_bytes());
+
+        bytes.write_i32::<LE>(1).unwrap(); // NumPackageData
+        write_fname(&mut bytes, 3); // PackageName
+        bytes.write_i64::<LE>(2582).unwrap(); // DiskSize
+        for word in [0x75203B7A, 0x4C2363A3, 0xAC223B82, 0xA9CBFA0A] {
+            bytes.write_u32::<LE>(word).unwrap();
+        }
+        bytes.write_u32::<LE>(0).unwrap(); // CookedHash invalid
+        bytes.write_u32::<LE>(0).unwrap(); // ReCook
+
+        let name_table_offset = bytes.len() as i64;
+        bytes[name_table_offset_pos..name_table_offset_pos + 8]
+            .copy_from_slice(&name_table_offset.to_le_bytes());
+        bytes.write_i32::<LE>(names.len() as i32).unwrap();
+        for name in names {
+            write_fstring(&mut bytes, name);
+            bytes.write_u16::<LE>(0).unwrap();
+            bytes.write_u16::<LE>(0).unwrap();
+        }
+
+        RawReader::new(
+            Chain::new(Cursor::new(bytes), None),
+            ObjectVersion::VER_UE4_ASSETREGISTRY_DEPENDENCYFLAGS,
+            ObjectVersionUE5::UNKNOWN,
+            false,
+            NameMap::new(),
+        )
+    }
+
+    #[test]
+    fn dev_registry_resolves_dev_dependency_section_into_direct_dependencies() {
+        let mut reader = minimal_dev_registry_with_initbank_hard_dependency();
+
+        let (assets, _) = parse_dev_registry(
+            &mut reader,
+            None,
+            false,
+            false,
+            false,
+            &FilterConfig::default(),
+        )
+        .unwrap();
+
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets[0].package_name, "/Game/InitBank");
+        assert_eq!(assets[0].direct_dependencies.hard, vec!["/Script/AkAudio"]);
+        assert!(assets[0].direct_dependencies.soft.is_empty());
+        assert_eq!(assets[0].dependency_count, 1);
+    }
+
     #[test]
     fn dev_package_data_consumes_four_byte_md5_valid_flag_and_recook_when_hash_absent() {
         let bytes = package_data_entry_bytes(false, true);
@@ -1129,7 +1516,14 @@ mod tests {
     fn dev_registry_rejects_versions_newer_than_supported_letsgos_format() {
         let mut reader = dev_registry_reader_with_version(9);
 
-        let result = parse_dev_registry(&mut reader, None, false, &FilterConfig::default());
+        let result = parse_dev_registry(
+            &mut reader,
+            None,
+            false,
+            false,
+            false,
+            &FilterConfig::default(),
+        );
         let err = match result {
             Ok(_) => panic!("version 9 should be rejected"),
             Err(err) => err,

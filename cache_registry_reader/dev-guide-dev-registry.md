@@ -102,10 +102,11 @@ enum Type {
 │     │  ┌─ Package Dependencies (Hard + Soft):
 │     │  │   int32  InDependenciesCount
 │     │  │   int32  SortIndexes[InDependenciesCount]  依赖节点索引
-│     │  │   int32  FlagWordCount = ceil(InDependenciesCount * 3 / 32)
-│     │  │   uint32 FlagWords[FlagWordCount]           每 3 bits 编码一个 EDependencyProperty
-│     │  │     HARD_BIT = 001 (Hard|Game|Build)
-│     │  │     SOFT_BIT = 010 (Game|Build)
+│     │  │   uint32 FlagWords[ceil(InDependenciesCount * 5 / 32)]
+│     │  │          每个依赖使用 5 bits packed EDependencyProperty（无额外长度字段）
+│     │  │          例如 0b00111 = Hard|Game|Build；导出 JSON 时仅保留带 Game 位的依赖
+
+
 │     │  │
 │     │  ┌─ Name Dependencies:
 │     │  │   int32  NameDependenciesCount
