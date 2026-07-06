@@ -323,6 +323,45 @@ struct PackageDepData {
     soft_deps: Vec<String>,
 }
 
+struct CachedObjectImport {
+    outer_index: i32,
+    object_name: String,
+    package_name: Option<String>,
+}
+
+fn fname_none_to_option(name: String) -> Option<String> {
+    (name != "None").then_some(name)
+}
+
+fn import_index_from_package_index(package_index: i32) -> Option<usize> {
+    (package_index < 0).then_some((-package_index - 1) as usize)
+}
+
+fn resolve_cached_import_package_name(
+    imports: &[CachedObjectImport],
+    import_index: usize,
+) -> Option<String> {
+    let mut current_index = import_index;
+    for _ in 0..imports.len() {
+        let import = imports.get(current_index)?;
+        if let Some(package_name) = &import.package_name {
+            return Some(package_name.clone());
+        }
+        if import.outer_index == 0 {
+            return fname_none_to_option(import.object_name.clone());
+        }
+        current_index = import_index_from_package_index(import.outer_index)?;
+    }
+    None
+}
+
+fn is_skipped_common_script_package(package_name: &str) -> bool {
+    matches!(
+        package_name,
+        "/Script/CoreUObject" | "/Script/Engine" | "/Script/BlueprintGraph" | "/Script/UnrealEd"
+    )
+}
+
 #[derive(Clone, Default)]
 struct DevDirectDeps {
     hard: Vec<String>,
@@ -370,15 +409,28 @@ fn parse_dependency_data(
 
     // TArray<FObjectImport> ImportMap → collect package names for hard deps
     let import_count = reader.read_i32::<LE>()?;
-    let mut hard_dep_candidates = Vec::with_capacity(import_count as usize);
+    if import_count < 0 {
+        return Err(format!("Negative import count: {}", import_count).into());
+    }
+    let mut imports = Vec::with_capacity(import_count as usize);
     for _ in 0..import_count {
         skip_fname(reader)?; // ClassPackage
         skip_fname(reader)?; // ClassName
-        reader.read_i32::<LE>()?; // OuterIndex
-        skip_fname(reader)?; // ObjectName
-        let dep_name = read_fname_str(reader)?;
-        hard_dep_candidates.push((dep_name != "None").then_some(dep_name));
+        let outer_index = reader.read_i32::<LE>()?; // OuterIndex
+        let object_name = read_fname_str(reader)?; // ObjectName
+        let package_name = fname_none_to_option(read_fname_str(reader)?); // PackageName
+        imports.push(CachedObjectImport {
+            outer_index,
+            object_name,
+            package_name,
+        });
     }
+    let hard_dep_candidates = (0..imports.len())
+        .map(|index| {
+            resolve_cached_import_package_name(&imports, index)
+                .filter(|name| !is_skipped_common_script_package(name))
+        })
+        .collect();
 
     // TArray<FName> SoftPackageReferenceList
     let soft_ref_count = reader.read_i32::<LE>()?;
@@ -1362,6 +1414,10 @@ mod tests {
             "/Game/HardEditorOnly",
             "/Game/SoftGame",
             "/Game/SoftEditorOnly",
+            "None",
+            "/Game/HardViaOuterRoot",
+            "ChildObject",
+            "/Script/Engine",
         ] {
             name_map
                 .get_mut()
@@ -1423,6 +1479,84 @@ mod tests {
 
         assert_eq!(dep.hard_deps, vec!["/Game/HardGame"]);
         assert_eq!(dep.soft_deps, vec!["/Game/SoftGame"]);
+    }
+
+    fn cached_dependency_data_with_common_script_imports() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        write_fname(&mut bytes, 0); // PackageName
+
+        bytes.write_i32::<LE>(3).unwrap(); // ImportMap count
+        for dep_pkg_index in [1, 11, 4] {
+            write_fname(&mut bytes, 1); // ClassPackage
+            write_fname(&mut bytes, 2); // ClassName
+            bytes.write_i32::<LE>(0).unwrap(); // OuterIndex
+            write_fname(&mut bytes, 3); // ObjectName
+            write_fname(&mut bytes, dep_pkg_index); // PackageName
+        }
+
+        bytes.write_i32::<LE>(0).unwrap(); // SoftPackageReferenceList count
+        bytes.write_i32::<LE>(0).unwrap(); // SearchableNamesMap count
+
+        write_fname(&mut bytes, 0); // FAssetPackageData PackageName
+        for word in [0x11223344, 0x55667788, 0x99AABBCC, 0xDDEEFF00] {
+            bytes.write_u32::<LE>(word).unwrap();
+        }
+        bytes.write_i64::<LE>(0).unwrap();
+
+        write_cached_bitarray(&mut bytes, 3, &[0b111]);
+        write_cached_bitarray(&mut bytes, 0, &[]);
+        bytes
+    }
+
+    #[test]
+    fn cached_dependency_data_skips_common_script_import_packages() {
+        let bytes = cached_dependency_data_with_common_script_imports();
+        let mut reader = cached_dependency_reader(bytes);
+
+        let dep = parse_dependency_data(&mut reader).unwrap();
+
+        assert_eq!(dep.hard_deps, vec!["/Game/HardGame"]);
+    }
+
+    fn cached_dependency_data_with_outer_chain_import_package() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        write_fname(&mut bytes, 0); // PackageName
+
+        bytes.write_i32::<LE>(2).unwrap(); // ImportMap count
+        write_fname(&mut bytes, 1); // ClassPackage
+        write_fname(&mut bytes, 2); // ClassName
+        bytes.write_i32::<LE>(0).unwrap(); // OuterIndex: null root package import
+        write_fname(&mut bytes, 9); // ObjectName: package name fallback
+        write_fname(&mut bytes, 8); // PackageName: None
+
+        write_fname(&mut bytes, 1); // ClassPackage
+        write_fname(&mut bytes, 2); // ClassName
+        bytes.write_i32::<LE>(-1).unwrap(); // OuterIndex: import 0
+        write_fname(&mut bytes, 10); // ObjectName: imported object
+        write_fname(&mut bytes, 8); // PackageName: None
+
+        bytes.write_i32::<LE>(0).unwrap(); // SoftPackageReferenceList count
+        bytes.write_i32::<LE>(0).unwrap(); // SearchableNamesMap count
+
+        write_fname(&mut bytes, 0); // FAssetPackageData PackageName
+        for word in [0x11223344, 0x55667788, 0x99AABBCC, 0xDDEEFF00] {
+            bytes.write_u32::<LE>(word).unwrap();
+        }
+        bytes.write_i64::<LE>(0).unwrap();
+
+        write_cached_bitarray(&mut bytes, 2, &[0b10]); // only child import is used in game
+        write_cached_bitarray(&mut bytes, 0, &[]);
+        bytes
+    }
+
+    #[test]
+    fn cached_dependency_data_resolves_import_package_through_outer_chain() {
+        let bytes = cached_dependency_data_with_outer_chain_import_package();
+        let mut reader = cached_dependency_reader(bytes);
+
+        let dep = parse_dependency_data(&mut reader).unwrap();
+
+        assert_eq!(dep.hard_deps, vec!["/Game/HardViaOuterRoot"]);
     }
 
     fn pack_dev_package_flags(flags: &[u8]) -> Vec<u32> {
