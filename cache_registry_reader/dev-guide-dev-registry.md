@@ -133,14 +133,15 @@ enum Type {
 │     │
 │     │   [如果 Version >= AddedCookedMD5Hash (6)]:
 │     │     FMD5Hash CookedHash
-│     │       uint8  bIsValid (0 或 1)
+│     │       uint32 bIsValid (0 或 1；FArchive bool 按 legacy UBOOL 序列化)
 │     │       [如果 bIsValid]: uint8 HashBytes[16]
 │     │
 │     └─ [如果 Version >= AddedReCookFlags (8)]:
-│           uint8  ReCook         (LetsGo 定制，0 或 1)
+│           uint32 ReCook         (LetsGo 定制 bool，同样按 legacy UBOOL 序列化)
 │
 ├─ Name Table (@NameTableOffset) ─────────────────────────────┤
 │   int32   NameCount
+
 │   for each FNameEntrySerialized:
 │     FString  Name           (通过 Ar << FString: int32 Len + 数据)
 │                              Len>0 → ANSI (Len-1 bytes + null)

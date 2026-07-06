@@ -37,9 +37,9 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Default)]
 struct FilterConfig {
-    class_set: HashSet<String>,        // exact match, case-insensitive, OR within class
-    path_glob: Option<String>,         // glob pattern for package_name, case-insensitive
-    chunk_set: HashSet<i32>,           // chunk_ids contains any of these
+    class_set: HashSet<String>, // exact match, case-insensitive, OR within class
+    path_glob: Option<String>,  // glob pattern for package_name, case-insensitive
+    chunk_set: HashSet<i32>,    // chunk_ids contains any of these
 }
 
 impl FilterConfig {
@@ -53,10 +53,7 @@ impl FilterConfig {
 // ---------------------------------------------------------------------------
 
 fn glob_match(pattern: &str, text: &str) -> bool {
-    glob_match_impl(
-        &pattern.to_lowercase(),
-        &text.to_lowercase(),
-    )
+    glob_match_impl(&pattern.to_lowercase(), &text.to_lowercase())
 }
 
 fn glob_match_impl(p: &str, t: &str) -> bool {
@@ -159,7 +156,9 @@ fn read_fname_str(reader: &mut Reader) -> Result<String, Box<dyn std::error::Err
     Ok(fname.get_content(|s| s.to_string()))
 }
 
-fn read_fstring_unlimited(reader: &mut Reader) -> Result<Option<String>, Box<dyn std::error::Error>> {
+fn read_fstring_unlimited(
+    reader: &mut Reader,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
     use std::mem::size_of;
     let len: i32 = reader.read_i32::<LE>()?;
     if len == 0 {
@@ -216,20 +215,30 @@ fn skip_bitarray(reader: &mut Reader) -> Result<(), Box<dyn std::error::Error>> 
 // Name table loading
 // ---------------------------------------------------------------------------
 
-fn load_name_table(reader: &mut Reader, name_table_offset: i64) -> Result<(), Box<dyn std::error::Error>> {
+fn load_name_table(
+    reader: &mut Reader,
+    name_table_offset: i64,
+) -> Result<(), Box<dyn std::error::Error>> {
     reader.seek(SeekFrom::Start(name_table_offset as u64))?;
     let name_count = reader.read_i32::<LE>()?;
     println!("  Name table: {} entries", name_count);
     for i in 0..name_count {
         let name = reader.read_fstring()?.unwrap_or_default();
-        reader.get_name_map().get_mut().add_name_reference(name, false);
+        reader
+            .get_name_map()
+            .get_mut()
+            .add_name_reference(name, false);
         reader.read_u16::<LE>()?; // NonCasePreservingHash
         reader.read_u16::<LE>()?; // CasePreservingHash
         if i < 5 {
             let nm = reader.get_name_map();
             let r = nm.get_ref();
             let list = r.get_name_map_index_list();
-            println!("    [{}] {}", list.len() - 1, r.get_name_reference((list.len() - 1) as i32));
+            println!(
+                "    [{}] {}",
+                list.len() - 1,
+                r.get_name_reference((list.len() - 1) as i32)
+            );
         }
     }
     println!("    ... {} total names loaded", name_count);
@@ -351,9 +360,9 @@ fn parse_dependency_data(
     }
 
     // FAssetPackageData::SerializeForCache
-    skip_fname(reader)?;                        // PackageName
-    let package_guid = read_guid_str(reader)?;  // Guid (16 bytes)
-    reader.read_i64::<LE>()?;                   // skip trailing 8 bytes (zeros in editor cache)
+    skip_fname(reader)?; // PackageName
+    let package_guid = read_guid_str(reader)?; // Guid (16 bytes)
+    reader.read_i64::<LE>()?; // skip trailing 8 bytes (zeros in editor cache)
 
     // TBitArray<> ImportUsedInGame
     skip_bitarray(reader)?;
@@ -375,7 +384,11 @@ fn filter_asset(asset: &AssetCore, filter: &FilterConfig) -> bool {
     // class filter (OR within dimension)
     if !filter.class_set.is_empty() {
         let class_lower = asset.asset_class.to_lowercase();
-        if !filter.class_set.iter().any(|c| c.to_lowercase() == class_lower) {
+        if !filter
+            .class_set
+            .iter()
+            .any(|c| c.to_lowercase() == class_lower)
+        {
             return false;
         }
     }
@@ -387,7 +400,11 @@ fn filter_asset(asset: &AssetCore, filter: &FilterConfig) -> bool {
     }
     // chunk filter (OR within dimension)
     if !filter.chunk_set.is_empty() {
-        if !asset.chunk_ids.iter().any(|id| filter.chunk_set.contains(id)) {
+        if !asset
+            .chunk_ids
+            .iter()
+            .any(|id| filter.chunk_set.contains(id))
+        {
             return false;
         }
     }
@@ -414,9 +431,9 @@ fn parse_all_assets(
 
     for i in 0..actual_pkg_count {
         // FDiskCachedAssetData
-        read_fname_str(reader)?;                // PackageName (outer) — skip
-        reader.read_i64::<LE>()?;               // Timestamp — skip
-        read_fname_str(reader)?;                // Extension — skip
+        read_fname_str(reader)?; // PackageName (outer) — skip
+        reader.read_i64::<LE>()?; // Timestamp — skip
+        read_fname_str(reader)?; // Extension — skip
         let asset_data_count = reader.read_i32::<LE>()?;
 
         // Collect core asset data
@@ -433,8 +450,16 @@ fn parse_all_assets(
             if !filter_asset(&a, filter) {
                 continue;
             }
-            let hard = if no_hard_refs { Vec::new() } else { dep.hard_deps.clone() };
-            let soft = if no_soft_refs { Vec::new() } else { dep.soft_deps.clone() };
+            let hard = if no_hard_refs {
+                Vec::new()
+            } else {
+                dep.hard_deps.clone()
+            };
+            let soft = if no_soft_refs {
+                Vec::new()
+            } else {
+                dep.soft_deps.clone()
+            };
             let dep_count = hard.len() + soft.len();
             assets.push(AssetEntry {
                 object_path: a.object_path,
@@ -450,7 +475,12 @@ fn parse_all_assets(
         }
 
         if show_progress && (i + 1) % 10000 == 0 {
-            println!("  Parsed {}/{} packages, {} assets...", i + 1, actual_pkg_count, assets.len());
+            println!(
+                "  Parsed {}/{} packages, {} assets...",
+                i + 1,
+                actual_pkg_count,
+                assets.len()
+            );
         }
     }
 
@@ -478,7 +508,10 @@ fn parse_cached_registry(
 
     let header_version = reader.read_i32::<LE>()?;
     if header_version != EXPECTED_HEADER_VERSION {
-        eprintln!("WARNING: Header version = {}, expected {}", header_version, EXPECTED_HEADER_VERSION);
+        eprintln!(
+            "WARNING: Header version = {}, expected {}",
+            header_version, EXPECTED_HEADER_VERSION
+        );
     } else {
         println!("Header Version: {} OK", header_version);
     }
@@ -498,8 +531,10 @@ fn parse_cached_registry(
     let guid_b = reader.read_u32::<LE>()?;
     let guid_c = reader.read_u32::<LE>()?;
     let guid_d = reader.read_u32::<LE>()?;
-    if guid_a != ASSET_REGISTRY_GUID[0] || guid_b != ASSET_REGISTRY_GUID[1]
-        || guid_c != ASSET_REGISTRY_GUID[2] || guid_d != ASSET_REGISTRY_GUID[3]
+    if guid_a != ASSET_REGISTRY_GUID[0]
+        || guid_b != ASSET_REGISTRY_GUID[1]
+        || guid_c != ASSET_REGISTRY_GUID[2]
+        || guid_d != ASSET_REGISTRY_GUID[3]
     {
         eprintln!(
             "WARNING: AssetRegistryVersion Guid mismatch: got {:08X}-{:08X}-{:08X}-{:08X}, expected {:08X}-{:08X}-{:08X}-{:08X}",
@@ -528,7 +563,15 @@ fn parse_cached_registry(
         println!("Limit: first {} packages", lim);
     }
 
-    let assets = parse_all_assets(reader, num_packages, limit, no_hard_refs, no_soft_refs, include_metadata, filter)?;
+    let assets = parse_all_assets(
+        reader,
+        num_packages,
+        limit,
+        no_hard_refs,
+        no_soft_refs,
+        include_metadata,
+        filter,
+    )?;
 
     if filter.is_active() {
         println!("  Filter matched {} assets", assets.len());
@@ -559,8 +602,10 @@ fn parse_dev_registry(
     let guid_b = reader.read_u32::<LE>()?;
     let guid_c = reader.read_u32::<LE>()?;
     let guid_d = reader.read_u32::<LE>()?;
-    if guid_a != ASSET_REGISTRY_GUID[0] || guid_b != ASSET_REGISTRY_GUID[1]
-        || guid_c != ASSET_REGISTRY_GUID[2] || guid_d != ASSET_REGISTRY_GUID[3]
+    if guid_a != ASSET_REGISTRY_GUID[0]
+        || guid_b != ASSET_REGISTRY_GUID[1]
+        || guid_c != ASSET_REGISTRY_GUID[2]
+        || guid_d != ASSET_REGISTRY_GUID[3]
     {
         eprintln!(
             "WARNING: AssetRegistryVersion Guid mismatch: got {:08X}-{:08X}-{:08X}-{:08X}",
@@ -571,10 +616,21 @@ fn parse_dev_registry(
     }
 
     let version = reader.read_i32::<LE>()?;
-    println!("AssetRegistryVersion: {} ({})", version, version_name(version));
+    println!(
+        "AssetRegistryVersion: {} ({})",
+        version,
+        version_name(version)
+    );
 
     if version < 4 {
         return Err(format!("Unsupported AssetRegistryVersion: {} (min: 4)", version).into());
+    }
+    if version > 8 {
+        return Err(format!(
+            "Unsupported AssetRegistryVersion: {} (max supported: 8, LetsGo AddedReCookFlags)",
+            version
+        )
+        .into());
     }
 
     // ---- NameTableOffset ----
@@ -616,7 +672,10 @@ fn parse_dev_registry(
     let total_to_read = asset_count as usize;
     if actual_count < total_to_read {
         let remaining = total_to_read - actual_count;
-        println!("  Skipping remaining {} assets to reach dependency section...", remaining);
+        println!(
+            "  Skipping remaining {} assets to reach dependency section...",
+            remaining
+        );
         for i in 0..remaining {
             parse_asset_core(reader, false)?; // skip without metadata collection
             if (i + 1) % 50000 == 0 {
@@ -632,7 +691,11 @@ fn parse_dev_registry(
     if version >= 7 {
         // AddedDependencyFlags: section is wrapped with a size field.
         let dep_section_size = reader.read_i64::<LE>()?;
-        println!("DependencySectionSize: {} bytes ({:.2} MB)", dep_section_size, dep_section_size as f64 / 1024.0 / 1024.0);
+        println!(
+            "DependencySectionSize: {} bytes ({:.2} MB)",
+            dep_section_size,
+            dep_section_size as f64 / 1024.0 / 1024.0
+        );
         println!("  Skipping dependency section (DependsNode graph not yet parsed)");
         reader.seek(SeekFrom::Current(dep_section_size))?;
     } else {
@@ -646,16 +709,19 @@ fn parse_dev_registry(
     let num_package_data = reader.read_i32::<LE>()?;
     println!("PackageData count: {}", num_package_data);
 
-    // NOTE: Format confirmed by UE source (AssetRegistryState.cpp:2586-2589):
-    //   FName(8) + DiskSize(8) + Guid(16) + bValid(1) + [hash(16 if bValid!=0)] + ReCook(1)
-    // Entries are variable-length: 34 bytes (bValid=0) or 50 bytes (bValid=1).
-    // Known issue: some files show systematic alignment drift on certain entries.
-    // See dev-guide-dev-registry.md for details.
+    // NOTE: Format confirmed by UE source (AssetRegistryState.cpp:2586-2589, Archive.cpp:482-505):
+    //   FName(8) + DiskSize(8) + Guid(16) + bValid(4) + [hash(16 if bValid!=0)] + ReCook(4)
+    // UE serializes bool through FArchive as legacy UBOOL (uint32), not 1 byte.
+    // Entries are variable-length: 40 bytes (bValid=0) or 56 bytes (bValid=1).
     for i in 0..num_package_data {
         let (pkg_name, guid) = read_dev_package_data_entry(reader, version)?;
         guid_map.insert(pkg_name, guid);
         if (i + 1) % 50000 == 0 {
-            println!("  Parsed {}/{} package data entries...", i + 1, num_package_data);
+            println!(
+                "  Parsed {}/{} package data entries...",
+                i + 1,
+                num_package_data
+            );
         }
     }
 
@@ -674,7 +740,10 @@ fn parse_dev_registry(
             package_path: a.package_path,
             package_guid: pkg_guid,
             chunk_ids: a.chunk_ids,
-            direct_dependencies: DepsContainer { hard: Vec::new(), soft: Vec::new() },
+            direct_dependencies: DepsContainer {
+                hard: Vec::new(),
+                soft: Vec::new(),
+            },
             dependency_count: 0,
         });
     }
@@ -692,22 +761,22 @@ fn read_dev_package_data_entry(
     reader: &mut Reader,
     version: i32,
 ) -> Result<(String, String), Box<dyn std::error::Error>> {
-    let pkg_name = read_fname_str(reader)?;    // PackageName (8 bytes)
-    reader.read_i64::<LE>()?;                   // DiskSize (8 bytes)
-    let guid = read_guid_str(reader)?;          // Guid (16 bytes)
+    let pkg_name = read_fname_str(reader)?; // PackageName (8 bytes)
+    reader.read_i64::<LE>()?; // DiskSize (8 bytes)
+    let guid = read_guid_str(reader)?; // Guid (16 bytes)
 
-    // FMD5Hash CookedHash: 1 byte bIsValid + [16 bytes if bIsValid != 0]
+    // FArchive serializes bool as legacy UBOOL (uint32), so FMD5Hash::bIsValid is 4 bytes.
     if version >= 6 {
-        let b_is_valid = reader.read_u8()?;
+        let b_is_valid = reader.read_u32::<LE>()?;
         if b_is_valid != 0 {
             let mut hash_buf = [0u8; 16];
             reader.read_exact(&mut hash_buf)?;
         }
     }
 
-    // ReCook flag (LetsGo custom, if version >= AddedReCookFlags == 8)
+    // ReCook flag (LetsGo custom bool, if version >= AddedReCookFlags == 8)
     if version >= 8 {
-        reader.read_u8()?;
+        reader.read_u32::<LE>()?;
     }
 
     Ok((pkg_name, guid))
@@ -821,7 +890,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Loading: {}", input_path);
     let file_bytes = fs::read(input_path)?;
     let file_len = file_bytes.len();
-    println!("File size: {} bytes ({:.2} MB)", file_len, file_len as f64 / 1024.0 / 1024.0);
+    println!(
+        "File size: {} bytes ({:.2} MB)",
+        file_len,
+        file_len as f64 / 1024.0 / 1024.0
+    );
 
     // ---- Detect format by first 4 bytes ----
     let first_u32 = {
@@ -842,7 +915,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!(
         "Format detected: {}",
-        if is_cached { "CachedAssetRegistry.bin" } else { "DevelopmentAssetRegistry.bin" }
+        if is_cached {
+            "CachedAssetRegistry.bin"
+        } else {
+            "DevelopmentAssetRegistry.bin"
+        }
     );
 
     // ---- Create reader (shared setup) ----
@@ -858,7 +935,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ---- Parse based on format ----
     let (assets, engine_version) = if is_cached {
-        parse_cached_registry(&mut reader, limit, no_hard_refs, no_soft_refs, include_metadata, &filter)?
+        parse_cached_registry(
+            &mut reader,
+            limit,
+            no_hard_refs,
+            no_soft_refs,
+            include_metadata,
+            &filter,
+        )?
     } else {
         let (assets, version) = parse_dev_registry(&mut reader, limit, include_metadata, &filter)?;
         let ev = format!("4.26.2 (registry v{})", version);
@@ -905,7 +989,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fs::write(&output_path, json)?;
 
     let output_size = fs::metadata(&output_path)?.len();
-    println!("Output: {} ({:.2} MB)", output_path, output_size as f64 / 1024.0 / 1024.0);
+    println!(
+        "Output: {} ({:.2} MB)",
+        output_path,
+        output_size as f64 / 1024.0 / 1024.0
+    );
     println!("Done!");
 
     Ok(())
@@ -929,4 +1017,120 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use byteorder::WriteBytesExt;
+
+    fn package_data_reader(bytes: Vec<u8>) -> Reader {
+        let mut name_map = NameMap::new();
+        name_map
+            .get_mut()
+            .add_name_reference("/Game/TestPackage".to_string(), false);
+
+        RawReader::new(
+            Chain::new(Cursor::new(bytes), None),
+            ObjectVersion::VER_UE4_ASSETREGISTRY_DEPENDENCYFLAGS,
+            ObjectVersionUE5::UNKNOWN,
+            false,
+            name_map,
+        )
+    }
+
+    fn package_data_entry_bytes(has_hash: bool, include_recook: bool) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.write_i32::<LE>(0).unwrap();
+        bytes.write_i32::<LE>(0).unwrap();
+        bytes.write_i64::<LE>(1234).unwrap();
+        for word in [0x11223344, 0x55667788, 0x99AABBCC, 0xDDEEFF00] {
+            bytes.write_u32::<LE>(word).unwrap();
+        }
+        bytes.write_u32::<LE>(u32::from(has_hash)).unwrap();
+        if has_hash {
+            bytes.extend_from_slice(&[0xAB; 16]);
+        }
+        if include_recook {
+            bytes.write_u32::<LE>(0).unwrap();
+        }
+        bytes
+    }
+
+    fn dev_registry_reader_with_version(version: i32) -> Reader {
+        let mut bytes = Vec::new();
+        for word in ASSET_REGISTRY_GUID {
+            bytes.write_u32::<LE>(word).unwrap();
+        }
+        bytes.write_i32::<LE>(version).unwrap();
+
+        RawReader::new(
+            Chain::new(Cursor::new(bytes), None),
+            ObjectVersion::VER_UE4_ASSETREGISTRY_DEPENDENCYFLAGS,
+            ObjectVersionUE5::UNKNOWN,
+            false,
+            NameMap::new(),
+        )
+    }
+
+    #[test]
+    fn dev_package_data_consumes_four_byte_md5_valid_flag_and_recook_when_hash_absent() {
+        let bytes = package_data_entry_bytes(false, true);
+        let mut reader = package_data_reader(bytes);
+
+        let (pkg_name, guid) = read_dev_package_data_entry(&mut reader, 8).unwrap();
+
+        assert_eq!(pkg_name, "/Game/TestPackage");
+        assert_eq!(guid, "{11223344-55667788-99AABBCC-DDEEFF00}");
+        assert_eq!(reader.seek(SeekFrom::Current(0)).unwrap(), 40);
+    }
+
+    #[test]
+    fn dev_package_data_consumes_four_byte_md5_valid_flag_and_recook_when_hash_present() {
+        let bytes = package_data_entry_bytes(true, true);
+        let mut reader = package_data_reader(bytes);
+
+        let (pkg_name, guid) = read_dev_package_data_entry(&mut reader, 8).unwrap();
+
+        assert_eq!(pkg_name, "/Game/TestPackage");
+        assert_eq!(guid, "{11223344-55667788-99AABBCC-DDEEFF00}");
+        assert_eq!(reader.seek(SeekFrom::Current(0)).unwrap(), 56);
+    }
+
+    #[test]
+    fn dev_package_data_omits_recook_before_letsgos_added_recook_version() {
+        let bytes = package_data_entry_bytes(false, false);
+        let mut reader = package_data_reader(bytes);
+
+        read_dev_package_data_entry(&mut reader, 7).unwrap();
+
+        assert_eq!(reader.seek(SeekFrom::Current(0)).unwrap(), 36);
+    }
+
+    #[test]
+    fn dev_package_data_keeps_alignment_across_consecutive_entries() {
+        let mut bytes = package_data_entry_bytes(true, true);
+        bytes.extend(package_data_entry_bytes(false, true));
+        let mut reader = package_data_reader(bytes);
+
+        read_dev_package_data_entry(&mut reader, 8).unwrap();
+        let (pkg_name, guid) = read_dev_package_data_entry(&mut reader, 8).unwrap();
+
+        assert_eq!(pkg_name, "/Game/TestPackage");
+        assert_eq!(guid, "{11223344-55667788-99AABBCC-DDEEFF00}");
+        assert_eq!(reader.seek(SeekFrom::Current(0)).unwrap(), 96);
+    }
+
+    #[test]
+    fn dev_registry_rejects_versions_newer_than_supported_letsgos_format() {
+        let mut reader = dev_registry_reader_with_version(9);
+
+        let result = parse_dev_registry(&mut reader, None, false, &FilterConfig::default());
+        let err = match result {
+            Ok(_) => panic!("version 9 should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("max supported: 8"));
+    }
 }
