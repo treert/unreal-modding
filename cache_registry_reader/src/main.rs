@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::io::{Cursor, Read, Seek, SeekFrom};
@@ -29,6 +30,61 @@ const ASSET_REGISTRY_GUID: [u32; 4] = [0x717F9EE7, 0xE9B0493A, 0x88B39132, 0x1B3
 const EXPECTED_ASSET_REGISTRY_VERSION: i32 = 7;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+// ---------------------------------------------------------------------------
+// Filter configuration
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct FilterConfig {
+    class_set: HashSet<String>,        // exact match, case-insensitive, OR within class
+    path_glob: Option<String>,         // glob pattern for package_name, case-insensitive
+    chunk_set: HashSet<i32>,           // chunk_ids contains any of these
+}
+
+impl FilterConfig {
+    fn is_active(&self) -> bool {
+        !self.class_set.is_empty() || self.path_glob.is_some() || !self.chunk_set.is_empty()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Case-insensitive glob matching (supports * and ?)
+// ---------------------------------------------------------------------------
+
+fn glob_match(pattern: &str, text: &str) -> bool {
+    glob_match_impl(
+        &pattern.to_lowercase(),
+        &text.to_lowercase(),
+    )
+}
+
+fn glob_match_impl(p: &str, t: &str) -> bool {
+    let pb = p.as_bytes();
+    let tb = t.as_bytes();
+    let mut pi = 0;
+    let mut ti = 0;
+    let mut star_p = None;
+    let mut match_t = 0;
+
+    while ti < tb.len() || pi < pb.len() {
+        if pi < pb.len() && pb[pi] == b'*' {
+            star_p = Some(pi);
+            match_t = ti;
+            pi += 1;
+        } else if pi < pb.len() && ti < tb.len() && (pb[pi] == b'?' || pb[pi] == tb[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if let Some(sp) = star_p {
+            pi = sp + 1;
+            match_t += 1;
+            ti = match_t;
+        } else {
+            return false;
+        }
+    }
+    true
+}
 
 // ---------------------------------------------------------------------------
 // JSON output structures (matching DevelopmentAssetRegistry.bin format)
@@ -315,6 +371,29 @@ fn parse_dependency_data(
 // Package parsing (flattened to asset list)
 // ---------------------------------------------------------------------------
 
+fn filter_asset(asset: &AssetCore, filter: &FilterConfig) -> bool {
+    // class filter (OR within dimension)
+    if !filter.class_set.is_empty() {
+        let class_lower = asset.asset_class.to_lowercase();
+        if !filter.class_set.iter().any(|c| c.to_lowercase() == class_lower) {
+            return false;
+        }
+    }
+    // path filter (glob against package_name — which is path + name)
+    if let Some(ref pat) = filter.path_glob {
+        if !glob_match(pat, &asset.package_name) {
+            return false;
+        }
+    }
+    // chunk filter (OR within dimension)
+    if !filter.chunk_set.is_empty() {
+        if !asset.chunk_ids.iter().any(|id| filter.chunk_set.contains(id)) {
+            return false;
+        }
+    }
+    true
+}
+
 fn parse_all_assets(
     reader: &mut Reader,
     num_packages: i32,
@@ -322,6 +401,7 @@ fn parse_all_assets(
     no_hard_refs: bool,
     no_soft_refs: bool,
     include_metadata: bool,
+    filter: &FilterConfig,
 ) -> Result<Vec<AssetEntry>, Box<dyn std::error::Error>> {
     let actual_pkg_count = if let Some(lim) = limit {
         num_packages.min(lim as i32) as usize
@@ -330,6 +410,7 @@ fn parse_all_assets(
     };
 
     let mut assets = Vec::new();
+    let show_progress = !filter.is_active();
 
     for i in 0..actual_pkg_count {
         // FDiskCachedAssetData
@@ -347,8 +428,11 @@ fn parse_all_assets(
         // Parse dependency data (shared by all assets in this package)
         let dep = parse_dependency_data(reader)?;
 
-        // Emit flattened entries
+        // Emit flattened entries (with optional filtering)
         for a in asset_cores {
+            if !filter_asset(&a, filter) {
+                continue;
+            }
             let hard = if no_hard_refs { Vec::new() } else { dep.hard_deps.clone() };
             let soft = if no_soft_refs { Vec::new() } else { dep.soft_deps.clone() };
             let dep_count = hard.len() + soft.len();
@@ -365,7 +449,7 @@ fn parse_all_assets(
             });
         }
 
-        if (i + 1) % 10000 == 0 {
+        if show_progress && (i + 1) % 10000 == 0 {
             println!("  Parsed {}/{} packages, {} assets...", i + 1, actual_pkg_count, assets.len());
         }
     }
@@ -389,10 +473,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("  Default output: ./tmp/output.json");
         eprintln!();
         eprintln!("Options:");
-        eprintln!("  --limit N       Only export the first N packages (default: all)");
-        eprintln!("  -NoHardRefs     Exclude hard references");
-        eprintln!("  -NoSoftRefs     Exclude soft references");
-        eprintln!("  -IncludeMetadata Include asset metadata (tags & values)");
+        eprintln!("  --limit N         Only export the first N packages (default: all)");
+        eprintln!("  -NoHardRefs       Exclude hard references");
+        eprintln!("  -NoSoftRefs       Exclude soft references");
+        eprintln!("  -IncludeMetadata  Include asset metadata (tags & values)");
+        eprintln!();
+        eprintln!("Filter Options (case-insensitive, combined with AND):");
+        eprintln!("  --class A,B,...   Filter by asset class (exact match, OR within)");
+        eprintln!("  --path GLOB       Filter by package name (glob: * = any, ? = one)");
+        eprintln!("  --chunk N,M,...   Filter by chunk ID (contains any, OR within)");
+        eprintln!();
+        eprintln!("Examples:");
+        eprintln!("  --class Blueprint,Texture2D");
+        eprintln!("  --path /Game/Characters/*");
+        eprintln!("  --path */BP_Sword*            (filter by asset name)");
+        eprintln!("  --class SkeletalMesh --path /Game/Characters/*/BP_Sword*");
         return Ok(());
     }
 
@@ -402,6 +497,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut no_hard_refs = false;
     let mut no_soft_refs = false;
     let mut include_metadata = false;
+    let mut filter = FilterConfig::default();
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
@@ -414,6 +510,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "-NoHardRefs" => no_hard_refs = true,
             "-NoSoftRefs" => no_soft_refs = true,
             "-IncludeMetadata" => include_metadata = true,
+            "--class" => {
+                i += 1;
+                if i < args.len() {
+                    for c in args[i].split(',') {
+                        let trimmed = c.trim();
+                        if !trimmed.is_empty() {
+                            filter.class_set.insert(trimmed.to_string());
+                        }
+                    }
+                }
+            }
+            "--path" => {
+                i += 1;
+                if i < args.len() {
+                    filter.path_glob = Some(args[i].clone());
+                }
+            }
+            "--chunk" => {
+                i += 1;
+                if i < args.len() {
+                    for n in args[i].split(',') {
+                        if let Ok(id) = n.trim().parse::<i32>() {
+                            filter.chunk_set.insert(id);
+                        }
+                    }
+                }
+            }
             other => {
                 output_path = other.to_string();
             }
@@ -498,7 +621,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Limit: first {} packages", lim);
     }
 
-    let assets = parse_all_assets(&mut reader, num_packages, limit, no_hard_refs, no_soft_refs, include_metadata)?;
+    let assets = parse_all_assets(&mut reader, num_packages, limit, no_hard_refs, no_soft_refs, include_metadata, &filter)?;
+
+    if filter.is_active() {
+        println!("  Filter matched {} assets", assets.len());
+    }
 
     // ---- Build metadata ----
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
