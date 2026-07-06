@@ -39,12 +39,11 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 struct FilterConfig {
     class_set: HashSet<String>, // exact match, case-insensitive, OR within class
     path_glob: Option<String>,  // glob pattern for package_name, case-insensitive
-    chunk_set: HashSet<i32>,    // chunk_ids contains any of these
 }
 
 impl FilterConfig {
     fn is_active(&self) -> bool {
-        !self.class_set.is_empty() || self.path_glob.is_some() || !self.chunk_set.is_empty()
+        !self.class_set.is_empty() || self.path_glob.is_some()
     }
 }
 
@@ -131,8 +130,6 @@ struct AssetEntry {
     package_path: String,
     #[serde(rename = "PackageGuid")]
     package_guid: String,
-    #[serde(rename = "ChunkIDs")]
-    chunk_ids: Vec<i32>,
     #[serde(rename = "DirectDependencies")]
     direct_dependencies: DepsContainer,
     #[serde(rename = "DependencyCount")]
@@ -263,7 +260,6 @@ struct AssetCore {
     asset_class: String,
     package_name: String,
     asset_name: String,
-    chunk_ids: Vec<i32>,
     #[allow(dead_code)]
     tags_and_values: Vec<(String, String)>,
 }
@@ -296,11 +292,10 @@ fn parse_asset_core(
         Vec::new()
     };
 
-    // ChunkIDs (TArray<int32>)
+    // ChunkIDs (TArray<int32>) — skipped
     let chunk_count = reader.read_i32::<LE>()?;
-    let mut chunk_ids = Vec::with_capacity(chunk_count as usize);
     for _ in 0..chunk_count {
-        chunk_ids.push(reader.read_i32::<LE>()?);
+        reader.read_i32::<LE>()?;
     }
 
     // Skip PackageFlags (uint32)
@@ -312,7 +307,6 @@ fn parse_asset_core(
         asset_class,
         package_name,
         asset_name,
-        chunk_ids,
         tags_and_values: tags,
     })
 }
@@ -669,16 +663,6 @@ fn filter_asset(asset: &AssetCore, filter: &FilterConfig) -> bool {
             return false;
         }
     }
-    // chunk filter (OR within dimension)
-    if !filter.chunk_set.is_empty() {
-        if !asset
-            .chunk_ids
-            .iter()
-            .any(|id| filter.chunk_set.contains(id))
-        {
-            return false;
-        }
-    }
     true
 }
 
@@ -739,7 +723,6 @@ fn parse_all_assets(
                 asset_class: a.asset_class,
                 package_path: a.package_path,
                 package_guid: dep.package_guid.clone(),
-                chunk_ids: a.chunk_ids,
                 direct_dependencies: DepsContainer { hard, soft },
                 dependency_count: dep_count,
             });
@@ -1020,7 +1003,6 @@ fn parse_dev_registry(
             asset_class: a.asset_class,
             package_path: a.package_path,
             package_guid: pkg_guid,
-            chunk_ids: a.chunk_ids,
             direct_dependencies: DepsContainer { hard, soft },
             dependency_count: dep_count,
         });
@@ -1103,7 +1085,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Filter Options (case-insensitive, combined with AND):");
         eprintln!("  --class A,B,...   Filter by asset class (exact match, OR within)");
         eprintln!("  --path GLOB       Filter by package name (glob: * = any, ? = one)");
-        eprintln!("  --chunk N,M,...   Filter by chunk ID (contains any, OR within)");
         eprintln!();
         eprintln!("Examples:");
         eprintln!("  --class Blueprint,Texture2D");
@@ -1151,16 +1132,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 i += 1;
                 if i < args.len() {
                     filter.path_glob = Some(args[i].clone());
-                }
-            }
-            "--chunk" => {
-                i += 1;
-                if i < args.len() {
-                    for n in args[i].split(',') {
-                        if let Ok(id) = n.trim().parse::<i32>() {
-                            filter.chunk_set.insert(id);
-                        }
-                    }
                 }
             }
             other => {
