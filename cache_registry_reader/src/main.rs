@@ -381,11 +381,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         eprintln!(
-            "Usage: {} <CachedAssetRegistry.bin> [output.json] [Options]",
+            "Usage: {} <CachedAssetRegistry.bin> [./tmp/output.json] [Options]",
             args[0]
         );
         eprintln!();
         eprintln!("  Parses UE4 Editor's CachedAssetRegistry.bin and exports to JSON.");
+        eprintln!("  Default output: ./tmp/output.json");
         eprintln!();
         eprintln!("Options:");
         eprintln!("  --limit N       Only export the first N packages (default: all)");
@@ -396,7 +397,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let input_path = &args[1];
-    let mut output_path = String::from("output.json");
+    let mut output_path = String::from("./tmp/output.json");
     let mut limit: Option<usize> = None;
     let mut no_hard_refs = false;
     let mut no_soft_refs = false;
@@ -532,6 +533,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let json = serde_json::to_string_pretty(&output)?;
+    // Ensure output directory exists
+    if let Some(parent) = std::path::Path::new(&output_path).parent() {
+        fs::create_dir_all(parent)?;
+    }
     fs::write(&output_path, json)?;
 
     let output_size = fs::metadata(&output_path)?.len();
