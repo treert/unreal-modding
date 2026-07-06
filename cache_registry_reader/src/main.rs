@@ -1077,35 +1077,51 @@ fn version_name(v: i32) -> &'static str {
 // Main
 // ---------------------------------------------------------------------------
 
+fn print_help(program: &str) {
+    eprintln!(
+        "Usage: {} <RegistryFile.bin> [Options]",
+        program
+    );
+    eprintln!();
+    eprintln!("  Parses UE4 CachedAssetRegistry.bin or DevelopmentAssetRegistry.bin");
+    eprintln!("  and exports to JSON. Format is auto-detected.");
+    eprintln!(
+        "  Default output: ./tmp/<input-file-name>.json (e.g. foo.bin -> ./tmp/foo.bin.json)"
+    );
+    eprintln!();
+    eprintln!("Options:");
+    eprintln!("  --output, -o PATH  Output JSON file path");
+    eprintln!("  --limit N          Only export the first N packages/assets (default: all)");
+    eprintln!("  -NoHardRefs        Exclude hard references");
+    eprintln!("  -NoSoftRefs        Exclude soft references");
+    eprintln!("  -IncludeMetadata   Include asset metadata (tags & values)");
+    eprintln!("  --help, -h         Show this help message");
+    eprintln!();
+    eprintln!("Filter Options (case-insensitive, combined with AND):");
+    eprintln!("  --class A,B,...    Filter by asset class (exact match, OR within)");
+    eprintln!("  --path GLOB        Filter by package name (glob: * = any, ? = one)");
+    eprintln!();
+    eprintln!("Examples:");
+    eprintln!("  {} CachedAssetRegistry.bin", program);
+    eprintln!("  {} CachedAssetRegistry.bin -o out.json", program);
+    eprintln!("  {} CachedAssetRegistry.bin --output ./reports/out.json --limit 100", program);
+    eprintln!("  --class Blueprint,Texture2D");
+    eprintln!("  --path /Game/Characters/*");
+    eprintln!("  --path */BP_Sword*            (filter by asset name)");
+    eprintln!("  --class SkeletalMesh --path /Game/Characters/*/BP_Sword*");
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
+
+    // --help / -h has highest priority
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help(&args[0]);
+        return Ok(());
+    }
+
     if args.len() < 2 {
-        eprintln!(
-            "Usage: {} <RegistryFile.bin> [./tmp/<input-file-name>.json] [Options]",
-            args[0]
-        );
-        eprintln!();
-        eprintln!("  Parses UE4 CachedAssetRegistry.bin or DevelopmentAssetRegistry.bin");
-        eprintln!("  and exports to JSON. Format is auto-detected.");
-        eprintln!(
-            "  Default output: ./tmp/<input-file-name>.json (e.g. foo.bin -> ./tmp/foo.bin.json)"
-        );
-        eprintln!();
-        eprintln!("Options:");
-        eprintln!("  --limit N         Only export the first N packages/assets (default: all)");
-        eprintln!("  -NoHardRefs       Exclude hard references");
-        eprintln!("  -NoSoftRefs       Exclude soft references");
-        eprintln!("  -IncludeMetadata  Include asset metadata (tags & values)");
-        eprintln!();
-        eprintln!("Filter Options (case-insensitive, combined with AND):");
-        eprintln!("  --class A,B,...   Filter by asset class (exact match, OR within)");
-        eprintln!("  --path GLOB       Filter by package name (glob: * = any, ? = one)");
-        eprintln!();
-        eprintln!("Examples:");
-        eprintln!("  --class Blueprint,Texture2D");
-        eprintln!("  --path /Game/Characters/*");
-        eprintln!("  --path */BP_Sword*            (filter by asset name)");
-        eprintln!("  --class SkeletalMesh --path /Game/Characters/*/BP_Sword*");
+        print_help(&args[0]);
         return Ok(());
     }
 
@@ -1123,6 +1139,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
+            "--output" | "-o" => {
+                i += 1;
+                if i < args.len() {
+                    output_path = args[i].clone();
+                } else {
+                    eprintln!("ERROR: --output requires a path argument");
+                    return Err("Missing value for --output".into());
+                }
+            }
             "--limit" => {
                 i += 1;
                 if i < args.len() {
@@ -1150,7 +1175,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             other => {
-                output_path = other.to_string();
+                eprintln!("WARNING: Unknown argument '{}' ignored. Use --help to see usage.", other);
             }
         }
         i += 1;
