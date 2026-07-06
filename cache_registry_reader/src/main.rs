@@ -202,13 +202,21 @@ fn read_guid_str(reader: &mut Reader) -> Result<String, Box<dyn std::error::Erro
     Ok(format!("{{{:08X}-{:08X}-{:08X}-{:08X}}}", a, b, c, d))
 }
 
-fn skip_bitarray(reader: &mut Reader) -> Result<(), Box<dyn std::error::Error>> {
+fn read_bitarray(reader: &mut Reader) -> Result<Vec<bool>, Box<dyn std::error::Error>> {
     let num_bits = reader.read_i32::<LE>()?;
-    let num_words = (num_bits + 31) / 32;
-    for _ in 0..num_words {
-        reader.read_u32::<LE>()?;
+    if num_bits < 0 {
+        return Err(format!("Negative bitarray size: {}", num_bits).into());
     }
-    Ok(())
+    let num_words = (num_bits + 31) / 32;
+    let mut words = Vec::with_capacity(num_words as usize);
+    for _ in 0..num_words {
+        words.push(reader.read_u32::<LE>()?);
+    }
+    let mut bits = Vec::with_capacity(num_bits as usize);
+    for bit_index in 0..num_bits as usize {
+        bits.push(bit_is_set(&words, bit_index));
+    }
+    Ok(bits)
 }
 
 // ---------------------------------------------------------------------------
@@ -334,6 +342,26 @@ const DEV_MANAGE_FLAG_SET_WIDTH: usize = 1;
 const DEV_DEP_PROPERTY_HARD: u8 = 0x1;
 const DEV_DEP_PROPERTY_GAME: u8 = 0x2;
 
+fn filter_cached_deps_by_used_in_game(
+    candidates: Vec<Option<String>>,
+    used_in_game: &[bool],
+) -> Vec<String> {
+    let mut deps: Vec<String> = candidates
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, dep)| {
+            if used_in_game.get(index).copied().unwrap_or(false) {
+                dep
+            } else {
+                None
+            }
+        })
+        .collect();
+    deps.sort();
+    deps.dedup();
+    deps
+}
+
 fn parse_dependency_data(
     reader: &mut Reader,
 ) -> Result<PackageDepData, Box<dyn std::error::Error>> {
@@ -342,31 +370,23 @@ fn parse_dependency_data(
 
     // TArray<FObjectImport> ImportMap → collect package names for hard deps
     let import_count = reader.read_i32::<LE>()?;
-    let mut hard_deps = Vec::with_capacity(import_count as usize);
+    let mut hard_dep_candidates = Vec::with_capacity(import_count as usize);
     for _ in 0..import_count {
         skip_fname(reader)?; // ClassPackage
         skip_fname(reader)?; // ClassName
         reader.read_i32::<LE>()?; // OuterIndex
         skip_fname(reader)?; // ObjectName
         let dep_name = read_fname_str(reader)?;
-        if dep_name != "None" {
-            hard_deps.push(dep_name);
-        }
+        hard_dep_candidates.push((dep_name != "None").then_some(dep_name));
     }
-    hard_deps.sort();
-    hard_deps.dedup();
 
     // TArray<FName> SoftPackageReferenceList
     let soft_ref_count = reader.read_i32::<LE>()?;
-    let mut soft_deps = Vec::with_capacity(soft_ref_count as usize);
+    let mut soft_dep_candidates = Vec::with_capacity(soft_ref_count as usize);
     for _ in 0..soft_ref_count {
         let dep = read_fname_str(reader)?;
-        if dep != "None" {
-            soft_deps.push(dep);
-        }
+        soft_dep_candidates.push((dep != "None").then_some(dep));
     }
-    soft_deps.sort();
-    soft_deps.dedup();
 
     // TMap<FPackageIndex, TArray<FName>> SearchableNamesMap — skip
     let map_count = reader.read_i32::<LE>()?;
@@ -383,10 +403,12 @@ fn parse_dependency_data(
     let package_guid = read_guid_str(reader)?; // Guid (16 bytes)
     reader.read_i64::<LE>()?; // skip trailing 8 bytes (zeros in editor cache)
 
-    // TBitArray<> ImportUsedInGame
-    skip_bitarray(reader)?;
-    // TBitArray<> SoftPackageUsedInGame
-    skip_bitarray(reader)?;
+    // TBitArray<> ImportUsedInGame / SoftPackageUsedInGame
+    let import_used_in_game = read_bitarray(reader)?;
+    let soft_package_used_in_game = read_bitarray(reader)?;
+    let hard_deps = filter_cached_deps_by_used_in_game(hard_dep_candidates, &import_used_in_game);
+    let soft_deps =
+        filter_cached_deps_by_used_in_game(soft_dep_candidates, &soft_package_used_in_game);
 
     Ok(PackageDepData {
         package_guid,
@@ -1327,6 +1349,80 @@ mod tests {
         for index in indexes {
             bytes.write_i32::<LE>(*index).unwrap();
         }
+    }
+
+    fn cached_dependency_reader(bytes: Vec<u8>) -> Reader {
+        let mut name_map = NameMap::new();
+        for name in [
+            "/Game/TestPackage",
+            "/Script/CoreUObject",
+            "Class",
+            "Object",
+            "/Game/HardGame",
+            "/Game/HardEditorOnly",
+            "/Game/SoftGame",
+            "/Game/SoftEditorOnly",
+        ] {
+            name_map
+                .get_mut()
+                .add_name_reference(name.to_string(), false);
+        }
+
+        RawReader::new(
+            Chain::new(Cursor::new(bytes), None),
+            ObjectVersion::VER_UE4_ASSETREGISTRY_DEPENDENCYFLAGS,
+            ObjectVersionUE5::UNKNOWN,
+            false,
+            name_map,
+        )
+    }
+
+    fn write_cached_bitarray(bytes: &mut Vec<u8>, num_bits: i32, words: &[u32]) {
+        bytes.write_i32::<LE>(num_bits).unwrap();
+        for word in words {
+            bytes.write_u32::<LE>(*word).unwrap();
+        }
+    }
+
+    fn cached_dependency_data_with_editor_only_dependencies() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        write_fname(&mut bytes, 0); // PackageName
+
+        bytes.write_i32::<LE>(2).unwrap(); // ImportMap count
+        for dep_pkg_index in [4, 5] {
+            write_fname(&mut bytes, 1); // ClassPackage
+            write_fname(&mut bytes, 2); // ClassName
+            bytes.write_i32::<LE>(0).unwrap(); // OuterIndex
+            write_fname(&mut bytes, 3); // ObjectName
+            write_fname(&mut bytes, dep_pkg_index); // PackageName
+        }
+
+        bytes.write_i32::<LE>(2).unwrap(); // SoftPackageReferenceList count
+        write_fname(&mut bytes, 6);
+        write_fname(&mut bytes, 7);
+
+        bytes.write_i32::<LE>(0).unwrap(); // SearchableNamesMap count
+
+        write_fname(&mut bytes, 0); // FAssetPackageData PackageName
+        for word in [0x11223344, 0x55667788, 0x99AABBCC, 0xDDEEFF00] {
+            bytes.write_u32::<LE>(word).unwrap();
+        }
+        bytes.write_i64::<LE>(0).unwrap();
+
+        write_cached_bitarray(&mut bytes, 2, &[0b01]); // only first import is used in game
+        write_cached_bitarray(&mut bytes, 2, &[0b01]); // only first soft ref is used in game
+        bytes
+    }
+
+    #[test]
+    fn cached_dependency_data_filters_import_and_soft_refs_by_used_in_game_bits() {
+        let bytes = cached_dependency_data_with_editor_only_dependencies();
+        let mut reader = cached_dependency_reader(bytes);
+
+        let dep = parse_dependency_data(&mut reader).unwrap();
+
+        assert_eq!(dep.hard_deps, vec!["/Game/HardGame"]);
+        assert_eq!(dep.soft_deps, vec!["/Game/SoftGame"]);
     }
 
     fn pack_dev_package_flags(flags: &[u8]) -> Vec<u32> {

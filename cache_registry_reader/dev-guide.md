@@ -74,8 +74,9 @@
 │        TArray<FName> SoftPackageReferenceList
 │        TMap<FPackageIndex, TArray<FName>> SearchableNamesMap
 │        FAssetPackageData::SerializeForCache
-│        TBitArray<> ImportUsedInGame      (int32 NumBits + byte data)
-│        TBitArray<> SoftPackageUsedInGame
+│        TBitArray<> ImportUsedInGame      (int32 NumBits + uint32 words)，按位过滤 ImportMap
+│        TBitArray<> SoftPackageUsedInGame (int32 NumBits + uint32 words)，按位过滤 SoftPackageReferenceList
+
 │
 ├─ Name Table (@NameTableOffset) ──────────────────────────────┤
 │   int32   NameCount
