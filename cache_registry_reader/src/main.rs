@@ -645,13 +645,46 @@ fn parse_dev_registry(
     println!("\n=== Package Data ===");
     let num_package_data = reader.read_i32::<LE>()?;
     println!("PackageData count: {}", num_package_data);
+
+    let mut ok_count = 0u64;
+    let mut err_count = 0u64;
     for i in 0..num_package_data {
-        let (pkg_name, guid) = read_dev_package_data_entry(reader, version, i)?;
-        guid_map.insert(pkg_name, guid);
-        if (i + 1) % 50000 == 0 {
-            println!("  Parsed {}/{} package data entries...", i + 1, num_package_data);
+        match read_dev_package_data_entry(reader, version) {
+            Ok((pkg_name, guid)) => {
+                guid_map.insert(pkg_name, guid);
+                ok_count += 1;
+                if ok_count % 100000 == 1 {
+                    println!("  Parsed {} / {} package data entries ({} errors so far)...", ok_count, num_package_data, err_count);
+                }
+            }
+            Err(e) => {
+                err_count += 1;
+                if err_count <= 5 || err_count % 1000 == 0 {
+                    eprintln!("  [WARN] entry {} failed: {}. Skipping (trying to resync)...", i, e);
+                }
+                // Try to resync: skip forward until we find a valid entry again
+                // Simple approach: skip 1 byte and retry up to 10 times
+                let mut recovered = false;
+                for skip in 1..=10 {
+                    match read_dev_package_data_entry(reader, version) {
+                        Ok((pkg_name, guid)) => {
+                            guid_map.insert(pkg_name, guid);
+                            ok_count += 1;
+                            recovered = true;
+                            eprintln!("    [RESYNC] recovered after skipping {} bytes", skip);
+                            break;
+                        }
+                        Err(_) => {}
+                    }
+                }
+                if !recovered {
+                    eprintln!("    [FATAL] cannot resync, bailing out");
+                    break;
+                }
+            }
         }
     }
+    println!("PackageData: {} ok, {} errors", ok_count, err_count);
 
     // ---- Build output ----
     let mut assets = Vec::with_capacity(asset_cores.len());
@@ -685,13 +718,12 @@ fn parse_dev_registry(
 fn read_dev_package_data_entry(
     reader: &mut Reader,
     version: i32,
-    _idx: i32,
 ) -> Result<(String, String), Box<dyn std::error::Error>> {
-    let pkg_name = read_fname_str(reader)?;    // PackageName
-    reader.read_i64::<LE>()?;                   // DiskSize
+    let pkg_name = read_fname_str(reader)?;    // PackageName (8 bytes)
+    reader.read_i64::<LE>()?;                   // DiskSize (8 bytes)
     let guid = read_guid_str(reader)?;          // Guid (16 bytes)
 
-    // FMD5Hash CookedHash (if version >= AddedCookedMD5Hash == 6)
+    // FMD5Hash CookedHash: 1 byte bIsValid + [16 bytes if bIsValid != 0]
     if version >= 6 {
         let b_is_valid = reader.read_u8()?;
         if b_is_valid != 0 {
