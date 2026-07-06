@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{Cursor, Read, Seek, SeekFrom};
@@ -458,6 +458,273 @@ fn parse_all_assets(
 }
 
 // ---------------------------------------------------------------------------
+// CachedAssetRegistry.bin parsing (extracted from main)
+// ---------------------------------------------------------------------------
+
+fn parse_cached_registry(
+    reader: &mut Reader,
+    limit: Option<usize>,
+    no_hard_refs: bool,
+    no_soft_refs: bool,
+    include_metadata: bool,
+    filter: &FilterConfig,
+) -> Result<(Vec<AssetEntry>, String), Box<dyn std::error::Error>> {
+    // ---- FNameTableArchive Header ----
+    let magic = reader.read_u32::<LE>()?;
+    if magic != MAGIC {
+        return Err(format!("Bad magic: 0x{:08X}, expected 0x{:08X}", magic, MAGIC).into());
+    }
+    println!("Magic: 0x{:08X} OK", magic);
+
+    let header_version = reader.read_i32::<LE>()?;
+    if header_version != EXPECTED_HEADER_VERSION {
+        eprintln!("WARNING: Header version = {}, expected {}", header_version, EXPECTED_HEADER_VERSION);
+    } else {
+        println!("Header Version: {} OK", header_version);
+    }
+
+    let name_table_offset = reader.read_i64::<LE>()?;
+    println!("NameTableOffset: 0x{:X}", name_table_offset);
+
+    // ---- Load name table ----
+    println!("\n=== Loading Name Table ===");
+    load_name_table(reader, name_table_offset)?;
+
+    // ---- Seek back to body start ----
+    reader.seek(SeekFrom::Start(0x10))?;
+
+    // ---- Validate AssetRegistryVersion ----
+    let guid_a = reader.read_u32::<LE>()?;
+    let guid_b = reader.read_u32::<LE>()?;
+    let guid_c = reader.read_u32::<LE>()?;
+    let guid_d = reader.read_u32::<LE>()?;
+    if guid_a != ASSET_REGISTRY_GUID[0] || guid_b != ASSET_REGISTRY_GUID[1]
+        || guid_c != ASSET_REGISTRY_GUID[2] || guid_d != ASSET_REGISTRY_GUID[3]
+    {
+        eprintln!(
+            "WARNING: AssetRegistryVersion Guid mismatch: got {:08X}-{:08X}-{:08X}-{:08X}, expected {:08X}-{:08X}-{:08X}-{:08X}",
+            guid_a, guid_b, guid_c, guid_d,
+            ASSET_REGISTRY_GUID[0], ASSET_REGISTRY_GUID[1], ASSET_REGISTRY_GUID[2], ASSET_REGISTRY_GUID[3],
+        );
+    } else {
+        println!("AssetRegistryVersion Guid: OK");
+    }
+
+    let asset_registry_version = reader.read_i32::<LE>()?;
+    if asset_registry_version != EXPECTED_ASSET_REGISTRY_VERSION {
+        eprintln!(
+            "WARNING: AssetRegistryVersion = {}, expected {}",
+            asset_registry_version, EXPECTED_ASSET_REGISTRY_VERSION
+        );
+    } else {
+        println!("AssetRegistryVersion: {} OK", asset_registry_version);
+    }
+
+    // ---- Parse body ----
+    let num_packages = reader.read_i32::<LE>()?;
+    println!("\n=== Parsing Packages ===");
+    println!("NumPackages: {}", num_packages);
+    if let Some(lim) = limit {
+        println!("Limit: first {} packages", lim);
+    }
+
+    let assets = parse_all_assets(reader, num_packages, limit, no_hard_refs, no_soft_refs, include_metadata, filter)?;
+
+    if filter.is_active() {
+        println!("  Filter matched {} assets", assets.len());
+    }
+
+    Ok((assets, String::from("4.26.2")))
+}
+
+// ---------------------------------------------------------------------------
+// DevelopmentAssetRegistry.bin parsing
+// ---------------------------------------------------------------------------
+
+/// Parse a DevelopmentAssetRegistry.bin (cooked FAssetRegistryState).
+///
+/// Format:
+///   GUID(16) + Version(4) + NameTableOffset(8) + Body(flat FAssetData list + Deps + PackageData)
+///
+/// The FAssetData::SerializeForCache format is identical to the one used in
+/// CachedAssetRegistry.bin, so we reuse `parse_asset_core`.
+fn parse_dev_registry(
+    reader: &mut Reader,
+    limit: Option<usize>,
+    include_metadata: bool,
+    filter: &FilterConfig,
+) -> Result<(Vec<AssetEntry>, i32), Box<dyn std::error::Error>> {
+    // ---- Header: GUID + Version ----
+    let guid_a = reader.read_u32::<LE>()?;
+    let guid_b = reader.read_u32::<LE>()?;
+    let guid_c = reader.read_u32::<LE>()?;
+    let guid_d = reader.read_u32::<LE>()?;
+    if guid_a != ASSET_REGISTRY_GUID[0] || guid_b != ASSET_REGISTRY_GUID[1]
+        || guid_c != ASSET_REGISTRY_GUID[2] || guid_d != ASSET_REGISTRY_GUID[3]
+    {
+        eprintln!(
+            "WARNING: AssetRegistryVersion Guid mismatch: got {:08X}-{:08X}-{:08X}-{:08X}",
+            guid_a, guid_b, guid_c, guid_d,
+        );
+    } else {
+        println!("AssetRegistryVersion Guid: OK");
+    }
+
+    let version = reader.read_i32::<LE>()?;
+    println!("AssetRegistryVersion: {} ({})", version, version_name(version));
+
+    if version < 4 {
+        return Err(format!("Unsupported AssetRegistryVersion: {} (min: 4)", version).into());
+    }
+
+    // ---- NameTableOffset ----
+    let name_table_offset = reader.read_i64::<LE>()?;
+    println!("NameTableOffset: 0x{:X}", name_table_offset);
+
+    // ---- Load name table ----
+    println!("\n=== Loading Name Table ===");
+    load_name_table(reader, name_table_offset)?;
+
+    // ---- Seek back to body start (0x1C) ----
+    reader.seek(SeekFrom::Start(0x1C))?;
+
+    // ---- Asset count ----
+    let asset_count = reader.read_i32::<LE>()?;
+    println!("\n=== Parsing Assets ===");
+    println!("AssetCount: {}", asset_count);
+    if let Some(lim) = limit {
+        println!("Limit: first {} assets", lim);
+    }
+
+    let actual_count = if let Some(lim) = limit {
+        (asset_count as usize).min(lim)
+    } else {
+        asset_count as usize
+    };
+    let show_progress = !filter.is_active();
+
+    // Parse assets we care about
+    let mut asset_cores = Vec::with_capacity(actual_count);
+    for i in 0..actual_count {
+        asset_cores.push(parse_asset_core(reader, include_metadata)?);
+        if show_progress && (i + 1) % 50000 == 0 {
+            println!("  Parsed {}/{} assets (collected)...", i + 1, actual_count);
+        }
+    }
+
+    // Skip remaining assets if limit is set (must read through to reach dep section)
+    let total_to_read = asset_count as usize;
+    if actual_count < total_to_read {
+        let remaining = total_to_read - actual_count;
+        println!("  Skipping remaining {} assets to reach dependency section...", remaining);
+        for i in 0..remaining {
+            parse_asset_core(reader, false)?; // skip without metadata collection
+            if (i + 1) % 50000 == 0 {
+                println!("  Skipped {}/{} assets...", i + 1, remaining);
+            }
+        }
+    }
+
+    // ---- Dependency section ----
+    println!("\n=== Dependency Section ===");
+    let mut guid_map: HashMap<String, String> = HashMap::new();
+
+    if version >= 7 {
+        // AddedDependencyFlags: section is wrapped with a size field.
+        let dep_section_size = reader.read_i64::<LE>()?;
+        println!("DependencySectionSize: {} bytes ({:.2} MB)", dep_section_size, dep_section_size as f64 / 1024.0 / 1024.0);
+        println!("  Skipping dependency section (DependsNode graph not yet parsed)");
+        reader.seek(SeekFrom::Current(dep_section_size))?;
+    } else {
+        eprintln!("WARNING: Version {} < 7, DependsNode skipping not implemented. Dependencies will be empty.", version);
+        // For old versions, we can't easily skip the dependency section.
+        // Just warn and continue; PackageData parsing may fail.
+    }
+
+    // ---- Package data ----
+    println!("\n=== Package Data ===");
+    let num_package_data = reader.read_i32::<LE>()?;
+    println!("PackageData count: {}", num_package_data);
+    for i in 0..num_package_data {
+        let (pkg_name, guid) = read_dev_package_data_entry(reader, version, i)?;
+        guid_map.insert(pkg_name, guid);
+        if (i + 1) % 50000 == 0 {
+            println!("  Parsed {}/{} package data entries...", i + 1, num_package_data);
+        }
+    }
+
+    // ---- Build output ----
+    let mut assets = Vec::with_capacity(asset_cores.len());
+    for a in asset_cores {
+        if !filter_asset(&a, filter) {
+            continue;
+        }
+        let pkg_guid = guid_map.get(&a.package_name).cloned().unwrap_or_default();
+        assets.push(AssetEntry {
+            object_path: a.object_path,
+            package_name: a.package_name,
+            asset_name: a.asset_name,
+            asset_class: a.asset_class,
+            package_path: a.package_path,
+            package_guid: pkg_guid,
+            chunk_ids: a.chunk_ids,
+            direct_dependencies: DepsContainer { hard: Vec::new(), soft: Vec::new() },
+            dependency_count: 0,
+        });
+    }
+
+    if filter.is_active() {
+        println!("  Filter matched {} assets", assets.len());
+    }
+
+    Ok((assets, version))
+}
+
+/// Read one FAssetPackageData entry from DevelopmentAssetRegistry.bin.
+/// Returns (package_name, package_guid).
+fn read_dev_package_data_entry(
+    reader: &mut Reader,
+    version: i32,
+    _idx: i32,
+) -> Result<(String, String), Box<dyn std::error::Error>> {
+    let pkg_name = read_fname_str(reader)?;    // PackageName
+    reader.read_i64::<LE>()?;                   // DiskSize
+    let guid = read_guid_str(reader)?;          // Guid (16 bytes)
+
+    // FMD5Hash CookedHash (if version >= AddedCookedMD5Hash == 6)
+    if version >= 6 {
+        let b_is_valid = reader.read_u8()?;
+        if b_is_valid != 0 {
+            let mut hash_buf = [0u8; 16];
+            reader.read_exact(&mut hash_buf)?;
+        }
+    }
+
+    // ReCook flag (LetsGo custom, if version >= AddedReCookFlags == 8)
+    if version >= 8 {
+        reader.read_u8()?;
+    }
+
+    Ok((pkg_name, guid))
+}
+
+/// Human-readable name for an FAssetRegistryVersion value.
+fn version_name(v: i32) -> &'static str {
+    match v {
+        0 => "PreVersioning",
+        1 => "HardSoftDependencies",
+        2 => "AddAssetRegistryState",
+        3 => "ChangedAssetData",
+        4 => "RemovedMD5Hash",
+        5 => "AddedHardManage",
+        6 => "AddedCookedMD5Hash",
+        7 => "AddedDependencyFlags",
+        8 => "AddedReCookFlags (LetsGo)",
+        _ => "Unknown",
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -465,15 +732,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         eprintln!(
-            "Usage: {} <CachedAssetRegistry.bin> [./tmp/output.json] [Options]",
+            "Usage: {} <RegistryFile.bin> [./tmp/output.json] [Options]",
             args[0]
         );
         eprintln!();
-        eprintln!("  Parses UE4 Editor's CachedAssetRegistry.bin and exports to JSON.");
+        eprintln!("  Parses UE4 CachedAssetRegistry.bin or DevelopmentAssetRegistry.bin");
+        eprintln!("  and exports to JSON. Format is auto-detected.");
         eprintln!("  Default output: ./tmp/output.json");
         eprintln!();
         eprintln!("Options:");
-        eprintln!("  --limit N         Only export the first N packages (default: all)");
+        eprintln!("  --limit N         Only export the first N packages/assets (default: all)");
         eprintln!("  -NoHardRefs       Exclude hard references");
         eprintln!("  -NoSoftRefs       Exclude soft references");
         eprintln!("  -IncludeMetadata  Include asset metadata (tags & values)");
@@ -550,7 +818,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let file_len = file_bytes.len();
     println!("File size: {} bytes ({:.2} MB)", file_len, file_len as f64 / 1024.0 / 1024.0);
 
-    // ---- Create reader ----
+    // ---- Detect format by first 4 bytes ----
+    let first_u32 = {
+        let mut c = Cursor::new(&file_bytes);
+        c.read_u32::<LE>()?
+    };
+
+    let is_cached = first_u32 == MAGIC;
+    let is_dev = first_u32 == ASSET_REGISTRY_GUID[0];
+
+    if !is_cached && !is_dev {
+        eprintln!(
+            "ERROR: Unknown file format. First 4 bytes: 0x{:08X} (expected 0x{:08X} for Cached or 0x{:08X} for Development)",
+            first_u32, MAGIC, ASSET_REGISTRY_GUID[0]
+        );
+        return Err("Unknown file format".into());
+    }
+
+    println!(
+        "Format detected: {}",
+        if is_cached { "CachedAssetRegistry.bin" } else { "DevelopmentAssetRegistry.bin" }
+    );
+
+    // ---- Create reader (shared setup) ----
     let cursor = Cursor::new(file_bytes);
     let name_map = NameMap::new();
     let mut reader = RawReader::new(
@@ -561,71 +851,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         name_map.clone(),
     );
 
-    // ---- FNameTableArchive Header ----
-    let magic = reader.read_u32::<LE>()?;
-    if magic != MAGIC {
-        eprintln!("ERROR: Bad magic: 0x{:08X}, expected 0x{:08X}", magic, MAGIC);
-        return Err("Invalid magic number".into());
-    }
-    println!("Magic: 0x{:08X} OK", magic);
-
-    let header_version = reader.read_i32::<LE>()?;
-    if header_version != EXPECTED_HEADER_VERSION {
-        eprintln!("WARNING: Header version = {}, expected {}", header_version, EXPECTED_HEADER_VERSION);
+    // ---- Parse based on format ----
+    let (assets, engine_version) = if is_cached {
+        parse_cached_registry(&mut reader, limit, no_hard_refs, no_soft_refs, include_metadata, &filter)?
     } else {
-        println!("Header Version: {} OK", header_version);
-    }
-
-    let name_table_offset = reader.read_i64::<LE>()?;
-    println!("NameTableOffset: 0x{:X}", name_table_offset);
-
-    // ---- Load name table ----
-    println!("\n=== Loading Name Table ===");
-    load_name_table(&mut reader, name_table_offset)?;
-
-    // ---- Seek back to body start ----
-    reader.seek(SeekFrom::Start(0x10))?;
-
-    // ---- Validate AssetRegistryVersion ----
-    let guid_a = reader.read_u32::<LE>()?;
-    let guid_b = reader.read_u32::<LE>()?;
-    let guid_c = reader.read_u32::<LE>()?;
-    let guid_d = reader.read_u32::<LE>()?;
-    if guid_a != ASSET_REGISTRY_GUID[0] || guid_b != ASSET_REGISTRY_GUID[1]
-        || guid_c != ASSET_REGISTRY_GUID[2] || guid_d != ASSET_REGISTRY_GUID[3]
-    {
-        eprintln!(
-            "WARNING: AssetRegistryVersion Guid mismatch: got {:08X}-{:08X}-{:08X}-{:08X}, expected {:08X}-{:08X}-{:08X}-{:08X}",
-            guid_a, guid_b, guid_c, guid_d,
-            ASSET_REGISTRY_GUID[0], ASSET_REGISTRY_GUID[1], ASSET_REGISTRY_GUID[2], ASSET_REGISTRY_GUID[3],
-        );
-    } else {
-        println!("AssetRegistryVersion Guid: OK");
-    }
-
-    let asset_registry_version = reader.read_i32::<LE>()?;
-    if asset_registry_version != EXPECTED_ASSET_REGISTRY_VERSION {
-        eprintln!(
-            "WARNING: AssetRegistryVersion = {}, expected {}",
-            asset_registry_version, EXPECTED_ASSET_REGISTRY_VERSION
-        );
-    } else {
-        println!("AssetRegistryVersion: {} OK", asset_registry_version);
-    }
-
-    // ---- Parse body ----
-    let num_packages = reader.read_i32::<LE>()?;
-    println!("\n=== Parsing Packages ===");
-    println!("NumPackages: {}", num_packages);
-    if let Some(lim) = limit {
-        println!("Limit: first {} packages", lim);
-    }
-
-    let assets = parse_all_assets(&mut reader, num_packages, limit, no_hard_refs, no_soft_refs, include_metadata, &filter)?;
-
-    if filter.is_active() {
-        println!("  Filter matched {} assets", assets.len());
-    }
+        let (assets, version) = parse_dev_registry(&mut reader, limit, include_metadata, &filter)?;
+        let ev = format!("4.26.2 (registry v{})", version);
+        (assets, ev)
+    };
 
     // ---- Build metadata ----
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
@@ -648,7 +881,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output = Output {
         metadata: OutputMetadata {
             export_time,
-            engine_version: String::from("4.26.2"),
+            engine_version,
             tool: String::from("cache-registry-reader"),
             version: VERSION.to_string(),
             include_hard_references: !no_hard_refs,
