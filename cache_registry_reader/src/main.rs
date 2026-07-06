@@ -252,6 +252,54 @@ fn read_u32_from_bytes(
     Ok(value)
 }
 
+fn read_i64_from_bytes(
+    bytes: &[u8],
+    offset: &mut usize,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    if bytes.len().saturating_sub(*offset) < 8 {
+        return Err("Unexpected end of FiBData lookup table while reading i64".into());
+    }
+    let value = i64::from_le_bytes(bytes[*offset..*offset + 8].try_into().unwrap());
+    *offset += 8;
+    Ok(value)
+}
+
+fn read_u64_from_bytes(
+    bytes: &[u8],
+    offset: &mut usize,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    if bytes.len().saturating_sub(*offset) < 8 {
+        return Err("Unexpected end of FiBData lookup table while reading u64".into());
+    }
+    let value = u64::from_le_bytes(bytes[*offset..*offset + 8].try_into().unwrap());
+    *offset += 8;
+    Ok(value)
+}
+
+fn read_f32_from_bytes(
+    bytes: &[u8],
+    offset: &mut usize,
+) -> Result<f32, Box<dyn std::error::Error>> {
+    if bytes.len().saturating_sub(*offset) < 4 {
+        return Err("Unexpected end of FiBData lookup table while reading f32".into());
+    }
+    let value = f32::from_le_bytes(bytes[*offset..*offset + 4].try_into().unwrap());
+    *offset += 4;
+    Ok(value)
+}
+
+fn read_f64_from_bytes(
+    bytes: &[u8],
+    offset: &mut usize,
+) -> Result<f64, Box<dyn std::error::Error>> {
+    if bytes.len().saturating_sub(*offset) < 8 {
+        return Err("Unexpected end of FiBData lookup table while reading f64".into());
+    }
+    let value = f64::from_le_bytes(bytes[*offset..*offset + 8].try_into().unwrap());
+    *offset += 8;
+    Ok(value)
+}
+
 fn read_u8_from_bytes(bytes: &[u8], offset: &mut usize) -> Result<u8, Box<dyn std::error::Error>> {
     if *offset >= bytes.len() {
         return Err("Unexpected end of FiBData lookup table while reading u8".into());
@@ -259,6 +307,17 @@ fn read_u8_from_bytes(bytes: &[u8], offset: &mut usize) -> Result<u8, Box<dyn st
     let value = bytes[*offset];
     *offset += 1;
     Ok(value)
+}
+
+fn read_ubool_from_bytes(
+    bytes: &[u8],
+    offset: &mut usize,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let value = read_u32_from_bytes(bytes, offset)?;
+    if value > 1 {
+        return Err(format!("Invalid FiBData UBOOL value: {}", value).into());
+    }
+    Ok(value != 0)
 }
 
 fn read_fstring_from_bytes(
@@ -325,14 +384,19 @@ fn read_fstring_from_bytes(
 fn read_fib_lookup_text(
     bytes: &[u8],
     offset: &mut usize,
+    none_history_has_culture_invariant_ubool: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let _flags = read_u32_from_bytes(bytes, offset)?;
     let history_type = read_u8_from_bytes(bytes, offset)? as i8;
     match history_type {
         -1 => {
-            let has_culture_invariant_string = read_u8_from_bytes(bytes, offset)? != 0;
-            if has_culture_invariant_string {
-                Ok(read_fstring_from_bytes(bytes, offset)?.unwrap_or_default())
+            if none_history_has_culture_invariant_ubool {
+                let has_culture_invariant_string = read_ubool_from_bytes(bytes, offset)?;
+                if has_culture_invariant_string {
+                    Ok(read_fstring_from_bytes(bytes, offset)?.unwrap_or_default())
+                } else {
+                    Ok(String::new())
+                }
             } else {
                 Ok(String::new())
             }
@@ -343,12 +407,63 @@ fn read_fib_lookup_text(
             let source = read_fstring_from_bytes(bytes, offset)?.unwrap_or_default();
             Ok(if source.is_empty() { key } else { source })
         }
+        1 => {
+            let format_text =
+                read_fib_lookup_text(bytes, offset, none_history_has_culture_invariant_ubool)?;
+            read_fib_format_named_arguments(
+                bytes,
+                offset,
+                none_history_has_culture_invariant_ubool,
+            )?;
+            Ok(format_text)
+        }
         other => Err(format!("Unsupported FiBData FText history type: {}", other).into()),
     }
 }
 
-fn read_fib_lookup_table(
+fn read_fib_format_argument_value(
     bytes: &[u8],
+    offset: &mut usize,
+    none_history_has_culture_invariant_ubool: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let arg_type = read_u8_from_bytes(bytes, offset)? as i8;
+    match arg_type {
+        0 => Ok(read_i64_from_bytes(bytes, offset)?.to_string()),
+        1 => Ok(read_u64_from_bytes(bytes, offset)?.to_string()),
+        2 => Ok(read_f32_from_bytes(bytes, offset)?.to_string()),
+        3 => Ok(read_f64_from_bytes(bytes, offset)?.to_string()),
+        4 => read_fib_lookup_text(bytes, offset, none_history_has_culture_invariant_ubool),
+        5 => Ok(String::new()),
+        other => Err(format!("Unsupported FiBData format argument type: {}", other).into()),
+    }
+}
+
+fn read_fib_format_named_arguments(
+    bytes: &[u8],
+    offset: &mut usize,
+    none_history_has_culture_invariant_ubool: bool,
+) -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
+    let count = read_i32_from_bytes(bytes, offset)?;
+    if count < 0 {
+        return Err(format!("Negative FiBData named format argument count: {}", count).into());
+    }
+
+    let mut arguments = BTreeMap::new();
+    for _ in 0..count {
+        let key = read_fstring_from_bytes(bytes, offset)?.unwrap_or_default();
+        let value = read_fib_format_argument_value(
+            bytes,
+            offset,
+            none_history_has_culture_invariant_ubool,
+        )?;
+        arguments.insert(key, value);
+    }
+    Ok(arguments)
+}
+
+fn read_fib_lookup_table_with_options(
+    bytes: &[u8],
+    none_history_has_culture_invariant_ubool: bool,
 ) -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
     let mut offset = 0;
     let count = read_i32_from_bytes(bytes, &mut offset)?;
@@ -359,10 +474,27 @@ fn read_fib_lookup_table(
     let mut lookup_table = BTreeMap::new();
     for _ in 0..count {
         let key = read_i32_from_bytes(bytes, &mut offset)?;
-        let value = read_fib_lookup_text(bytes, &mut offset)?;
+        let value =
+            read_fib_lookup_text(bytes, &mut offset, none_history_has_culture_invariant_ubool)?;
         lookup_table.insert(key.to_string(), value);
     }
     Ok(lookup_table)
+}
+
+fn read_fib_lookup_table(
+    bytes: &[u8],
+) -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
+    match read_fib_lookup_table_with_options(bytes, true) {
+        Ok(lookup_table) => Ok(lookup_table),
+        Err(modern_err) => match read_fib_lookup_table_with_options(bytes, false) {
+            Ok(lookup_table) => Ok(lookup_table),
+            Err(legacy_err) => Err(format!(
+                "FiBData lookup table decode failed as modern FText ({}) and legacy FText ({})",
+                modern_err, legacy_err
+            )
+            .into()),
+        },
+    }
 }
 
 fn summarize_fib_data(value: &str) -> String {
@@ -1690,6 +1822,27 @@ mod tests {
         write_fstring(bytes, value);
     }
 
+    fn write_fib_none_text(bytes: &mut Vec<u8>) {
+        bytes.write_u32::<LE>(0).unwrap();
+        bytes.write_i8(-1).unwrap(); // ETextHistoryType::None
+        bytes.write_u32::<LE>(0).unwrap(); // FArchive serializes bool as legacy UBOOL
+    }
+
+    fn write_fib_legacy_none_text(bytes: &mut Vec<u8>) {
+        bytes.write_u32::<LE>(0).unwrap();
+        bytes.write_i8(-1).unwrap(); // ETextHistoryType::None before culture-invariant bool existed
+    }
+
+    fn write_fib_named_format_text(bytes: &mut Vec<u8>) {
+        bytes.write_u32::<LE>(0).unwrap();
+        bytes.write_i8(1).unwrap(); // ETextHistoryType::NamedFormat
+        write_fib_base_text(bytes, "Hello {Name}");
+        bytes.write_i32::<LE>(1).unwrap();
+        write_fstring(bytes, "Name");
+        bytes.write_i8(4).unwrap(); // EFormatArgumentType::Text
+        write_fib_base_text(bytes, "World");
+    }
+
     fn encoded_fib_data_sample() -> String {
         let mut lookup_table = Vec::new();
         lookup_table.write_i32::<LE>(2).unwrap();
@@ -1743,6 +1896,48 @@ mod tests {
         assert_eq!(object["LookupTable"]["0"], "Root");
         assert_eq!(object["LookupTable"]["1"], "Value");
         assert_eq!(object["Json"]["0"], "1");
+    }
+
+    #[test]
+    fn fib_lookup_table_consumes_four_byte_bool_for_none_text_history() {
+        let mut lookup_table = Vec::new();
+        lookup_table.write_i32::<LE>(2).unwrap();
+        lookup_table.write_i32::<LE>(0).unwrap();
+        write_fib_none_text(&mut lookup_table);
+        lookup_table.write_i32::<LE>(1).unwrap();
+        write_fib_base_text(&mut lookup_table, "ValueAfterNone");
+
+        let decoded = read_fib_lookup_table(&lookup_table).unwrap();
+
+        assert_eq!(decoded["0"], "");
+        assert_eq!(decoded["1"], "ValueAfterNone");
+    }
+
+    #[test]
+    fn fib_lookup_table_supports_legacy_none_text_without_bool() {
+        let mut lookup_table = Vec::new();
+        lookup_table.write_i32::<LE>(2).unwrap();
+        lookup_table.write_i32::<LE>(0).unwrap();
+        write_fib_legacy_none_text(&mut lookup_table);
+        lookup_table.write_i32::<LE>(1).unwrap();
+        write_fib_base_text(&mut lookup_table, "LegacyValueAfterNone");
+
+        let decoded = read_fib_lookup_table(&lookup_table).unwrap();
+
+        assert_eq!(decoded["0"], "");
+        assert_eq!(decoded["1"], "LegacyValueAfterNone");
+    }
+
+    #[test]
+    fn fib_lookup_table_supports_named_format_text_history() {
+        let mut lookup_table = Vec::new();
+        lookup_table.write_i32::<LE>(1).unwrap();
+        lookup_table.write_i32::<LE>(0).unwrap();
+        write_fib_named_format_text(&mut lookup_table);
+
+        let decoded = read_fib_lookup_table(&lookup_table).unwrap();
+
+        assert_eq!(decoded["0"], "Hello {Name}");
     }
 
     fn write_asset_core(bytes: &mut Vec<u8>) {
