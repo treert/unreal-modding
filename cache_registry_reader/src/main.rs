@@ -646,45 +646,18 @@ fn parse_dev_registry(
     let num_package_data = reader.read_i32::<LE>()?;
     println!("PackageData count: {}", num_package_data);
 
-    let mut ok_count = 0u64;
-    let mut err_count = 0u64;
+    // NOTE: Format confirmed by UE source (AssetRegistryState.cpp:2586-2589):
+    //   FName(8) + DiskSize(8) + Guid(16) + bValid(1) + [hash(16 if bValid!=0)] + ReCook(1)
+    // Entries are variable-length: 34 bytes (bValid=0) or 50 bytes (bValid=1).
+    // Known issue: some files show systematic alignment drift on certain entries.
+    // See dev-guide-dev-registry.md for details.
     for i in 0..num_package_data {
-        match read_dev_package_data_entry(reader, version) {
-            Ok((pkg_name, guid)) => {
-                guid_map.insert(pkg_name, guid);
-                ok_count += 1;
-                if ok_count % 100000 == 1 {
-                    println!("  Parsed {} / {} package data entries ({} errors so far)...", ok_count, num_package_data, err_count);
-                }
-            }
-            Err(e) => {
-                err_count += 1;
-                if err_count <= 5 || err_count % 1000 == 0 {
-                    eprintln!("  [WARN] entry {} failed: {}. Skipping (trying to resync)...", i, e);
-                }
-                // Try to resync: skip forward until we find a valid entry again
-                // Simple approach: skip 1 byte and retry up to 10 times
-                let mut recovered = false;
-                for skip in 1..=10 {
-                    match read_dev_package_data_entry(reader, version) {
-                        Ok((pkg_name, guid)) => {
-                            guid_map.insert(pkg_name, guid);
-                            ok_count += 1;
-                            recovered = true;
-                            eprintln!("    [RESYNC] recovered after skipping {} bytes", skip);
-                            break;
-                        }
-                        Err(_) => {}
-                    }
-                }
-                if !recovered {
-                    eprintln!("    [FATAL] cannot resync, bailing out");
-                    break;
-                }
-            }
+        let (pkg_name, guid) = read_dev_package_data_entry(reader, version)?;
+        guid_map.insert(pkg_name, guid);
+        if (i + 1) % 50000 == 0 {
+            println!("  Parsed {}/{} package data entries...", i + 1, num_package_data);
         }
     }
-    println!("PackageData: {} ok, {} errors", ok_count, err_count);
 
     // ---- Build output ----
     let mut assets = Vec::with_capacity(asset_cores.len());
