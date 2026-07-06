@@ -134,7 +134,9 @@ enum Type {
 │     [v>=6] FMD5Hash: uint32 bIsValid + [16 bytes hash]       │
 │     [v>=8] uint32 ReCook (LetsGo)                            │
 │                                                              │
-│   条目长度: bValid=0 → 40 bytes, bValid=1 → 56 bytes         │
+│   条目长度: v<6 → 32 bytes                                   │
+│            v6-v7: bValid=0 → 36 bytes, bValid=1 → 52 bytes   │
+│            v8+:   bValid=0 → 40 bytes, bValid=1 → 56 bytes   │
 │                                                              │
 ├─ Name Table (@NameTableOffset) ──────────────────────────────┤
 │   (与 Cached 格式完全相同)                                     │

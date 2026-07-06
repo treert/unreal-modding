@@ -4,7 +4,7 @@ edition = "2021"
 version.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "UE4 CachedAssetRegistry.bin binary parser and JSON exporter"
+description = "UE4 CachedAssetRegistry.bin and DevelopmentAssetRegistry.bin parser and JSON exporter"
 repository.workspace = true
 
 [dependencies]

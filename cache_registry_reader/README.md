@@ -78,15 +78,15 @@ cargo run --release -p cache-registry-reader -- input.bin -o output.json
       "PackagePath": "/Game/Path",
       "PackageGuid": "{75203B7A-4C2363A3-AC223B82-A9CBFA0A}",
       "DirectDependencies": {
-        "Hard": ["/Script/Engine"],
-        "Soft": []
+        "Hard": ["/Script/Engine"]
       },
-      "DependencyCount": 1,
-      "TagsAndValues": null
+      "DependencyCount": 1
     }
   ]
 }
 ```
+
+说明：`DirectDependencies.Hard` / `DirectDependencies.Soft` 仅在对应数组非空时输出；`TagsAndValues` 仅在启用 `-IncludeMetadata` 且存在元数据时输出，未输出不等同于 JSON `null`。
 
 ## 支持的格式
 
