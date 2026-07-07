@@ -88,6 +88,8 @@ fn glob_match_impl(p: &str, t: &str) -> bool {
 
 #[derive(Serialize)]
 struct OutputMetadata {
+    #[serde(rename = "InputFile")]
+    input_file: String,
     #[serde(rename = "ExportTime")]
     export_time: String,
     #[serde(rename = "EngineVersion")]
@@ -1541,6 +1543,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("output");
+    // Normalize the input path for the metadata record (use canonical absolute path
+    // when possible so the JSON record is self-describing regardless of cwd).
+    let input_file_meta = std::fs::canonicalize(input_path)
+        .ok()
+        .and_then(|p| p.to_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| input_path.clone());
     let mut output_path = format!("./tmp/{}.json", input_file_name);
     let mut limit: Option<usize> = None;
     let mut no_hard_refs = false;
@@ -1692,6 +1700,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n=== Writing JSON ({} assets) ===", total_assets);
     let output = Output {
         metadata: OutputMetadata {
+            input_file: input_file_meta,
             export_time,
             engine_version,
             tool: String::from("cache-registry-reader"),
