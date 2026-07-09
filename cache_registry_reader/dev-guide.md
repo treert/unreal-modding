@@ -79,7 +79,11 @@ enum Type {
 │     TArray<FObjectImport> ImportMap                          │
 │     TArray<FName> SoftPackageReferenceList                   │
 │     TMap<FPackageIndex, TArray<FName>> SearchableNamesMap    │
-│     FAssetPackageData PackageData                            │
+│     FAssetPackageData PackageData:                           │
+│       int64    DiskSize (源 .uasset 文件大小)                 │
+│       FGuid    PackageGuid (16 bytes)                        │
+│       FMD5Hash CookedHash (uint32 bIsValid + [16B hash])     │
+│       uint32   ReCook (LetsGo, bool→uint32)                  │
 │     TBitArray<> ImportUsedInGame                             │
 │     TBitArray<> SoftPackageUsedInGame                        │
 │                                                              │

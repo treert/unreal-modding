@@ -132,6 +132,8 @@ struct AssetEntry {
     package_path: String,
     #[serde(rename = "PackageGuid")]
     package_guid: String,
+    #[serde(rename = "DiskSize")]
+    disk_size: i64,
     #[serde(rename = "DirectDependencies")]
     direct_dependencies: DepsContainer,
     #[serde(rename = "DependencyCount")]
@@ -718,6 +720,7 @@ fn parse_asset_core(
 
 struct PackageDepData {
     package_guid: String,
+    disk_size: i64,
     hard_deps: Vec<String>,
     soft_deps: Vec<String>,
 }
@@ -849,10 +852,18 @@ fn parse_dependency_data(
         }
     }
 
-    // FAssetPackageData::SerializeForCache
-    skip_fname(reader)?; // PackageName
-    let package_guid = read_guid_str(reader)?; // Guid (16 bytes)
-    reader.read_i64::<LE>()?; // skip trailing 8 bytes (zeros in editor cache)
+    // FAssetPackageData::SerializeForCache (AssetData.h:667)
+    // Field order: DiskSize(int64) → PackageGuid(FGuid) → CookedHash(FMD5Hash) → ReCook(bool→uint32)
+    let disk_size = reader.read_i64::<LE>()?; // DiskSize
+    let package_guid = read_guid_str(reader)?; // PackageGuid (16 bytes)
+    // CookedHash: FMD5Hash serializes bIsValid as legacy UBOOL (uint32), then 16-byte hash if valid.
+    let cooked_hash_valid = reader.read_u32::<LE>()?;
+    if cooked_hash_valid != 0 {
+        let mut hash_buf = [0u8; 16];
+        reader.read_exact(&mut hash_buf)?;
+    }
+    // ReCook (LetsGo custom, bool → uint32). SerializeForCache writes it unconditionally.
+    reader.read_u32::<LE>()?;
 
     // TBitArray<> ImportUsedInGame / SoftPackageUsedInGame
     let import_used_in_game = read_bitarray(reader)?;
@@ -863,6 +874,7 @@ fn parse_dependency_data(
 
     Ok(PackageDepData {
         package_guid,
+        disk_size,
         hard_deps,
         soft_deps,
     })
@@ -1137,6 +1149,7 @@ fn parse_all_assets(
                 asset_class: a.asset_class,
                 package_path: a.package_path,
                 package_guid: dep.package_guid.clone(),
+                disk_size: dep.disk_size,
                 direct_dependencies: DepsContainer { hard, soft },
                 dependency_count: dep_count,
                 tags_and_values: tags,
@@ -1360,7 +1373,7 @@ fn parse_dev_registry(
 
     // ---- Dependency section ----
     println!("\n=== Dependency Section ===");
-    let mut guid_map: HashMap<String, String> = HashMap::new();
+    let mut guid_map: HashMap<String, (String, i64)> = HashMap::new();
     let mut deps_map: HashMap<String, DevDirectDeps> = HashMap::new();
 
     if version >= 7 {
@@ -1392,8 +1405,8 @@ fn parse_dev_registry(
     // UE serializes bool through FArchive as legacy UBOOL (uint32), not 1 byte.
     // Entries are variable-length: 40 bytes (bValid=0) or 56 bytes (bValid=1).
     for i in 0..num_package_data {
-        let (pkg_name, guid) = read_dev_package_data_entry(reader, version)?;
-        guid_map.insert(pkg_name, guid);
+        let (pkg_name, guid, disk_size) = read_dev_package_data_entry(reader, version)?;
+        guid_map.insert(pkg_name, (guid, disk_size));
         if (i + 1) % 50000 == 0 {
             println!(
                 "  Parsed {}/{} package data entries...",
@@ -1409,7 +1422,10 @@ fn parse_dev_registry(
         if !filter_asset(&a, filter) {
             continue;
         }
-        let pkg_guid = guid_map.get(&a.package_name).cloned().unwrap_or_default();
+        let (pkg_guid, pkg_disk_size) = guid_map
+            .get(&a.package_name)
+            .cloned()
+            .unwrap_or_default();
         let deps = deps_map.get(&a.package_name).cloned().unwrap_or_default();
         let hard = if no_hard_refs { Vec::new() } else { deps.hard };
         let soft = if no_soft_refs { Vec::new() } else { deps.soft };
@@ -1429,6 +1445,7 @@ fn parse_dev_registry(
             asset_class: a.asset_class,
             package_path: a.package_path,
             package_guid: pkg_guid,
+            disk_size: pkg_disk_size,
             direct_dependencies: DepsContainer { hard, soft },
             dependency_count: dep_count,
             tags_and_values: tags,
@@ -1443,13 +1460,13 @@ fn parse_dev_registry(
 }
 
 /// Read one FAssetPackageData entry from DevelopmentAssetRegistry.bin.
-/// Returns (package_name, package_guid).
+/// Returns (package_name, package_guid, disk_size).
 fn read_dev_package_data_entry(
     reader: &mut Reader,
     version: i32,
-) -> Result<(String, String), Box<dyn std::error::Error>> {
+) -> Result<(String, String, i64), Box<dyn std::error::Error>> {
     let pkg_name = read_fname_str(reader)?; // PackageName (8 bytes)
-    reader.read_i64::<LE>()?; // DiskSize (8 bytes)
+    let disk_size = reader.read_i64::<LE>()?; // DiskSize (8 bytes)
     let guid = read_guid_str(reader)?; // Guid (16 bytes)
 
     // FArchive serializes bool as legacy UBOOL (uint32), so FMD5Hash::bIsValid is 4 bytes.
@@ -1466,7 +1483,7 @@ fn read_dev_package_data_entry(
         reader.read_u32::<LE>()?;
     }
 
-    Ok((pkg_name, guid))
+    Ok((pkg_name, guid, disk_size))
 }
 
 /// Human-readable name for an FAssetRegistryVersion value.
@@ -2033,11 +2050,11 @@ mod tests {
 
         bytes.write_i32::<LE>(0).unwrap(); // SearchableNamesMap count
 
-        write_fname(&mut bytes, 0); // FAssetPackageData PackageName
+        write_fname(&mut bytes, 0); // DiskSize (int64, =0 in test)
         for word in [0x11223344, 0x55667788, 0x99AABBCC, 0xDDEEFF00] {
             bytes.write_u32::<LE>(word).unwrap();
         }
-        bytes.write_i64::<LE>(0).unwrap();
+        bytes.write_i64::<LE>(0).unwrap(); // CookedHash(bIsValid=0) + ReCook(0)
 
         write_cached_bitarray(&mut bytes, 2, &[0b01]); // only first import is used in game
         write_cached_bitarray(&mut bytes, 2, &[0b01]); // only first soft ref is used in game
@@ -2071,11 +2088,11 @@ mod tests {
         bytes.write_i32::<LE>(0).unwrap(); // SoftPackageReferenceList count
         bytes.write_i32::<LE>(0).unwrap(); // SearchableNamesMap count
 
-        write_fname(&mut bytes, 0); // FAssetPackageData PackageName
+        write_fname(&mut bytes, 0); // DiskSize (int64, =0 in test)
         for word in [0x11223344, 0x55667788, 0x99AABBCC, 0xDDEEFF00] {
             bytes.write_u32::<LE>(word).unwrap();
         }
-        bytes.write_i64::<LE>(0).unwrap();
+        bytes.write_i64::<LE>(0).unwrap(); // CookedHash(bIsValid=0) + ReCook(0)
 
         write_cached_bitarray(&mut bytes, 3, &[0b111]);
         write_cached_bitarray(&mut bytes, 0, &[]);
@@ -2112,11 +2129,11 @@ mod tests {
         bytes.write_i32::<LE>(0).unwrap(); // SoftPackageReferenceList count
         bytes.write_i32::<LE>(0).unwrap(); // SearchableNamesMap count
 
-        write_fname(&mut bytes, 0); // FAssetPackageData PackageName
+        write_fname(&mut bytes, 0); // DiskSize (int64, =0 in test)
         for word in [0x11223344, 0x55667788, 0x99AABBCC, 0xDDEEFF00] {
             bytes.write_u32::<LE>(word).unwrap();
         }
-        bytes.write_i64::<LE>(0).unwrap();
+        bytes.write_i64::<LE>(0).unwrap(); // CookedHash(bIsValid=0) + ReCook(0)
 
         write_cached_bitarray(&mut bytes, 2, &[0b10]); // only child import is used in game
         write_cached_bitarray(&mut bytes, 0, &[]);
@@ -2274,10 +2291,11 @@ mod tests {
         let bytes = package_data_entry_bytes(false, true);
         let mut reader = package_data_reader(bytes);
 
-        let (pkg_name, guid) = read_dev_package_data_entry(&mut reader, 8).unwrap();
+        let (pkg_name, guid, disk_size) = read_dev_package_data_entry(&mut reader, 8).unwrap();
 
         assert_eq!(pkg_name, "/Game/TestPackage");
         assert_eq!(guid, "{11223344-55667788-99AABBCC-DDEEFF00}");
+        assert_eq!(disk_size, 1234);
         assert_eq!(reader.seek(SeekFrom::Current(0)).unwrap(), 40);
     }
 
@@ -2286,10 +2304,11 @@ mod tests {
         let bytes = package_data_entry_bytes(true, true);
         let mut reader = package_data_reader(bytes);
 
-        let (pkg_name, guid) = read_dev_package_data_entry(&mut reader, 8).unwrap();
+        let (pkg_name, guid, disk_size) = read_dev_package_data_entry(&mut reader, 8).unwrap();
 
         assert_eq!(pkg_name, "/Game/TestPackage");
         assert_eq!(guid, "{11223344-55667788-99AABBCC-DDEEFF00}");
+        assert_eq!(disk_size, 1234);
         assert_eq!(reader.seek(SeekFrom::Current(0)).unwrap(), 56);
     }
 
@@ -2310,10 +2329,11 @@ mod tests {
         let mut reader = package_data_reader(bytes);
 
         read_dev_package_data_entry(&mut reader, 8).unwrap();
-        let (pkg_name, guid) = read_dev_package_data_entry(&mut reader, 8).unwrap();
+        let (pkg_name, guid, disk_size) = read_dev_package_data_entry(&mut reader, 8).unwrap();
 
         assert_eq!(pkg_name, "/Game/TestPackage");
         assert_eq!(guid, "{11223344-55667788-99AABBCC-DDEEFF00}");
+        assert_eq!(disk_size, 1234);
         assert_eq!(reader.seek(SeekFrom::Current(0)).unwrap(), 96);
     }
 
