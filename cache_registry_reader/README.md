@@ -60,10 +60,11 @@ cargo run --release -p cache-registry-reader -- input.bin -o output.json
 ```json
 {
   "Metadata": {
+    "InputFile": "D:/path/to/CachedAssetRegistry.bin",
     "ExportTime": "2025.01.15-10.30.00",
     "EngineVersion": "4.26.2 (registry v8)",
     "Tool": "cache-registry-reader",
-    "Version": "0.1.0",
+    "Version": "0.1.16",
     "IncludeHardReferences": true,
     "IncludeSoftReferences": true,
     "IncludeMetadata": false,
@@ -77,6 +78,7 @@ cargo run --release -p cache-registry-reader -- input.bin -o output.json
       "AssetClass": "Blueprint",
       "PackagePath": "/Game/Path",
       "PackageGuid": "{75203B7A-4C2363A3-AC223B82-A9CBFA0A}",
+      "DiskSize": 12345,
       "DirectDependencies": {
         "Hard": ["/Script/Engine"]
       },
