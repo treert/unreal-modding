@@ -11,5 +11,6 @@ repository.workspace = true
 unreal_asset_base.workspace = true
 unreal_helpers.workspace = true
 byteorder.workspace = true
+glob.workspace = true
 serde.workspace = true
 serde_json.workspace = true

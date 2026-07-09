@@ -52,34 +52,18 @@ impl FilterConfig {
 // ---------------------------------------------------------------------------
 
 fn glob_match(pattern: &str, text: &str) -> bool {
-    glob_match_impl(&pattern.to_lowercase(), &text.to_lowercase())
-}
+    let Ok(pattern) = glob::Pattern::new(pattern) else {
+        return false;
+    };
 
-fn glob_match_impl(p: &str, t: &str) -> bool {
-    let pb = p.as_bytes();
-    let tb = t.as_bytes();
-    let mut pi = 0;
-    let mut ti = 0;
-    let mut star_p = None;
-    let mut match_t = 0;
-
-    while ti < tb.len() || pi < pb.len() {
-        if pi < pb.len() && pb[pi] == b'*' {
-            star_p = Some(pi);
-            match_t = ti;
-            pi += 1;
-        } else if pi < pb.len() && ti < tb.len() && (pb[pi] == b'?' || pb[pi] == tb[ti]) {
-            pi += 1;
-            ti += 1;
-        } else if let Some(sp) = star_p {
-            pi = sp + 1;
-            match_t += 1;
-            ti = match_t;
-        } else {
-            return false;
-        }
-    }
-    true
+    pattern.matches_with(
+        text,
+        glob::MatchOptions {
+            case_sensitive: false,
+            require_literal_separator: false,
+            require_literal_leading_dot: false,
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1891,6 +1875,12 @@ mod tests {
             bytes_to_ue_string(&lookup_table),
             r#"{"0":"1"}"#
         )
+    }
+
+    #[test]
+    fn glob_match_returns_false_when_star_suffix_cannot_match() {
+        assert!(!glob_match("*a", "bbb"));
+        assert!(!glob_match("*/BP_Sword*", "/Game/Characters/Foo"));
     }
 
     #[test]
